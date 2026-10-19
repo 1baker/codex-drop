@@ -74,7 +74,7 @@ partial or unverified result. A missing receipt cannot establish what attached.
 Remove already attached images from the local queue before explicitly attaching
 again. Recovery lists each recorded chat/thread; a legacy receipt can lack that
 identity. Check every affected draft before marking the listed uploads as checked.
-The checkbox and **Mark as checked** action save a separate durable
+The checkbox and **Mark checked and allow a new upload** action save a separate durable
 acknowledgement; they never rewrite the original attachment result or upload
 anything. Queued files require an explicit Attach after recovery. A later drop,
 focus, reconnect, session renewal or page-resume event cannot resend them.

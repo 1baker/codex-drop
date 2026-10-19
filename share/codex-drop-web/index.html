@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="same-origin">
 <meta name="color-scheme" content="light dark">
-<title>Codex Drop</title>
+<title>Codex Drop – Screenshot drop</title>
 <style>
 :root {
   --bg: #f5f6f8; --card: #ffffff; --text: #1b1f24; --muted: #5b6470; --line: #d6dae0;
@@ -27,81 +27,101 @@ body {
   font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
 }
-main { max-width: 860px; margin: 0 auto; display: grid; gap: 12px; }
-header h1 { margin: 4px 0 0; font-size: 1.4rem; }
-header p { margin: 2px 0 0; color: var(--muted); font-size: .95rem; }
-section.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
-section.card h2 { margin: 0 0 8px; font-size: 1.1rem; }
-.strip-top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; justify-content: space-between; }
-.state { font-weight: 600; margin: 0; flex: 1 1 260px; }
+main { max-width: 860px; margin: 0 auto; display: grid; gap: 16px; }
+header { padding: 8px 4px 0; }
+header h1 { margin: 0; font-size: 1.5rem; line-height: 1.2; letter-spacing: -.01em; }
+header .subtitle { margin: 4px 0 0; color: var(--accent); font-weight: 600; font-size: 1rem; }
+header p { margin: 8px 0 0; color: var(--muted); font-size: .95rem; max-width: 62ch; }
+section.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; min-width: 0; }
+section.card h2 { margin: 0 0 12px; font-size: 1.05rem; font-weight: 600; line-height: 1.3; }
+.strip-top { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline; justify-content: space-between; }
+.state { font-weight: 600; margin: 0; flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
 .badge { font-size: .8rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; white-space: normal; overflow-wrap: anywhere; max-width: 100%; }
 .badge.warn { color: var(--warn); border-color: var(--warn); }
-.message { margin: 6px 0 0; }
-.error { margin: 6px 0 0; color: var(--bad); font-weight: 600; white-space: pre-wrap; }
+.message { margin: 8px 0 0; overflow-wrap: anywhere; }
+.error { margin: 8px 0 0; color: var(--bad); font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
 .error:empty, .message:empty, .hint:empty { display: none; }
-.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
-.dest { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+.dest { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-top: 16px; }
 .dest label { font-weight: 600; }
-.dest select { flex: 1 1 220px; min-width: 0; }
+.dest select { flex: 1 1 220px; min-width: 0; max-width: 100%; text-overflow: ellipsis; }
 button, select {
   font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
-  padding: 10px 14px; min-height: 44px;
+  padding: 10px 16px; min-height: 44px;
 }
 button { cursor: pointer; }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
 button:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-.target-name { margin: 8px 0 0; overflow-wrap: anywhere; }
-dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0 0; font-size: .9rem; }
+button.primary:focus-visible { outline-color: var(--text); box-shadow: inset 0 0 0 2px var(--accent-text); }
+.target-name { margin: 12px 0 0; min-width: 0; overflow-wrap: anywhere; }
+details { margin-top: 8px; }
+dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 12px; margin: 8px 0 0; font-size: .9rem; }
 dl.facts dt { color: var(--muted); }
-dl.facts dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+dl.facts dd { margin: 0; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 .zone {
   border: 2px dashed var(--accent); background: var(--zone); border-radius: var(--radius);
-  padding: 28px 16px; text-align: center; display: grid; gap: 12px; justify-items: center;
+  padding: 32px 16px; text-align: center; display: grid; gap: 12px; justify-items: center; align-content: center;
 }
+.zone:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
 .zone.dragging { background: var(--zone-active); border-style: solid; }
 .zone.disabled { opacity: .6; }
 .zone p { margin: 0; }
+.zone .only-desktop { font-size: 1.15rem; }
 .hint { color: var(--muted); font-size: .9rem; }
 .only-desktop { display: block; }
-@media (hover: none) and (pointer: coarse) { .only-desktop { display: none; } .zone { padding: 18px 12px; } }
+@media (min-width: 640px) { .zone { min-height: 220px; padding: 40px 24px; } }
+@media (hover: none) and (pointer: coarse) { .only-desktop { display: none; } .zone { min-height: 0; padding: 20px 12px; } }
 .visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-ul.queue { list-style: none; margin: 12px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+ul.queue { list-style: none; margin: 16px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr)); gap: 12px; }
 ul.queue:empty { display: none; }
-ul.queue li { border: 1px solid var(--line); border-radius: 10px; padding: 8px; display: grid; gap: 6px; }
+ul.queue li { border: 1px solid var(--line); border-radius: 10px; padding: 8px; display: grid; gap: 8px; min-width: 0; }
 ul.queue img { width: 100%; height: 110px; object-fit: cover; border-radius: 6px; background: var(--zone); }
-ul.queue .name { font-size: .85rem; overflow-wrap: anywhere; }
+ul.queue .name { font-size: .85rem; min-width: 0; overflow-wrap: anywhere; }
 ul.queue .size { font-size: .8rem; color: var(--muted); }
 ul.queue button { min-height: 44px; padding: 6px 10px; font-size: .85rem; }
 .totals { color: var(--muted); font-size: .9rem; margin: 8px 0 0; }
-.op { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-top: 10px; }
-.op h3 { margin: 0 0 6px; font-size: 1rem; }
-.op ul { margin: 6px 0 0; padding-left: 18px; }
+.op { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 12px; min-width: 0; overflow-wrap: anywhere; }
+.op h3 { margin: 0 0 8px; font-size: 1rem; }
+.op ul { margin: 8px 0 0; padding-left: 20px; }
 .op li { margin: 4px 0; overflow-wrap: anywhere; }
 .op p { margin: 4px 0 0; }
-ul.incidents { margin: 8px 0 0; padding-left: 18px; }
+ul.incidents { margin: 8px 0 0; padding-left: 20px; }
 ul.incidents li { margin: 4px 0; overflow-wrap: anywhere; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; overflow-wrap: anywhere; }
 .ok { color: var(--ok); font-weight: 600; }
 .warn { color: var(--warn); font-weight: 600; }
 .bad { color: var(--bad); font-weight: 600; }
-.recovery { border-color: var(--warn); }
-label.ack { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; min-height: 44px; }
+section.card.recovery { border-left: 4px solid var(--warn); }
+label.ack { display: flex; gap: 12px; align-items: flex-start; margin-top: 16px; min-height: 44px; }
 label.ack input { width: 24px; height: 24px; margin-top: 2px; flex: none; }
-details summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
-.storage p { margin: 6px 0 0; }
-footer { color: var(--muted); font-size: .85rem; text-align: center; }
+details summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; font-weight: 600; }
+.storage p { margin: 8px 0 0; }
+footer { color: var(--muted); font-size: .85rem; text-align: center; padding: 0 8px; }
+@media (max-width: 420px) {
+  section.card { padding: 12px; }
+  dl.facts { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  dl.facts dd { margin-bottom: 8px; }
+  .row > button, .dest > button { flex: 1 1 100%; }
+}
+@media (forced-colors: active) {
+  button:focus-visible, button.primary:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid CanvasText; box-shadow: none; }
+  .zone { border-color: CanvasText; }
+  .zone:focus-within { outline-color: Highlight; }
+  section.card.recovery { border-left-color: CanvasText; }
+}
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1>Codex Drop</h1>
+    <p class="subtitle">Screenshot drop</p>
     <p>Attach screenshots to an existing Codex draft on your home computer. Nothing is sent for you; review and send the draft in Codex yourself.</p>
   </header>
 
   <section class="card" aria-labelledby="status-heading">
-    <h2 id="status-heading" class="visually-hidden">Status and destination</h2>
+    <h2 id="status-heading">Chat</h2>
     <div class="strip-top">
       <p id="state" class="state" role="status" aria-live="polite">Starting…</p>
       <span id="session-badge" class="badge" hidden></span>
@@ -127,7 +147,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
   </section>
 
   <section class="card" aria-labelledby="drop-heading">
-    <h2 id="drop-heading" class="visually-hidden">Screenshots</h2>
+    <h2 id="drop-heading">Screenshots</h2>
     <div id="zone" class="zone">
       <p class="only-desktop"><strong>Drag screenshots here</strong> or paste them</p>
       <button type="button" id="choose" class="primary">Choose screenshots</button>

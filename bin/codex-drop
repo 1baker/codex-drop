@@ -1,0 +1,1101 @@
+#!/usr/bin/env python3
+"""Drop Windows screenshots into one exact, already running Codex composer.
+
+Modes:
+  client   work WSL: framed request on stdin -> nested ssh bastion -> home
+  receive  home: framed request on stdin -> store, verify target, paste path
+  target   home: print the live target tuple for --thread/--socket
+  bundle   home: emit the self-contained Windows PowerShell drop window
+
+Wire format: 4-byte big-endian length + UTF-8 JSON request on stdin; one
+ASCII JSON object plus newline on stdout. Nothing else is written to stdout.
+The client mode must work when exec'd from stdin without __file__.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = 1
+MAX_REQUEST = 80 * 1024 * 1024
+MAX_IMAGE = 25 * 1024 * 1024
+MAX_BATCH = 50 * 1024 * 1024
+MAX_FILES = 10
+MAX_REPLY = 1024 * 1024
+MAX_TOKEN = 4096
+RECEIVER = '/home/YOUR_HOME_USER/.local/bin/codex-drop'
+REMOTE_COMMAND = 'python3 -I ' + RECEIVER + ' receive'
+STORE_PARTS = ('.local', 'share', 'codex-drop', 'screenshots')
+PRIVATE_DEPTH = 2  # codex-drop/ and screenshots/ must be 0700
+OPS = ('test_route', 'target', 'upload')
+READ_ONLY_HOME_OPS = ('catalog', 'presence', 'inspect')
+UUID_RE = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
+SOCKET_RE = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*')
+HOST_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+SAFE_PATH_RE = re.compile(r'/[A-Za-z0-9_./-]+')
+SHA_RE = re.compile(r'[0-9a-f]{64}')
+IMAGE_MARK_RE = re.compile(r'\[Image #(\d+)\]')
+SSH_OPTIONS = ('-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+               '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=no',
+               '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no')
+IDENTITY_KEYS = ('thread', 'socket', 'pane', 'pane_pid', 'window', 'tui_pid', 'tui_start')
+PANE_FORMAT = '\t'.join(('#{pane_id}', '#{pane_pid}', '#{pane_in_mode}', '#{window_id}',
+                         '#{pane_tty}', '#{@byobu-codex-thread-id}', '#{session_name}',
+                         '#{window_name}'))
+APPROVAL_HINTS = ('would you like to run', 'would you like to make', 'would you like to apply',
+                  'allow command', 'approve this', 'yes, proceed', "don't ask again",
+                  'press enter to confirm', 'enter to confirm', 'do you trust the', '(y/n)')
+SSH_MESSAGES = {
+    'bastion_auth': 'Bastion refused the background (BatchMode) login. The interactive '
+                    'terminal may rely on a password, one-time code or agent this hidden '
+                    'process cannot use. Nothing was requested or changed.',
+    'bastion_hostkey': 'Bastion host key is unknown or changed in the work known_hosts. '
+                       'Nothing was trusted or changed.',
+    'bastion_unreachable': 'Bastion could not be reached from work WSL.',
+    'bastion_ssh': 'SSH to Bastion failed.',
+    'home_auth': 'Home refused the background (BatchMode) login made from Bastion.',
+    'home_hostkey': 'Home host key is unknown or changed in the Bastion known_hosts. '
+                    'Nothing was trusted or changed.',
+    'home_unreachable': 'Home could not be reached from Bastion.',
+    'home_ssh': 'SSH from Bastion to home failed.',
+}
+
+
+class DropError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def error_reply(code, message):
+    return dict(ok=False, error=dict(code=code, message=message))
+
+
+def clean_text(value, limit=300):
+    text = ''.join(ch if ch.isprintable() else ' ' for ch in str(value))
+    return text[-limit:].strip()
+
+
+# --- framing -----------------------------------------------------------------
+
+def read_exact(stream, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise DropError('truncated', 'Input ended before the declared length')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+
+def read_frame(stream, limit=MAX_REQUEST):
+    size = struct.unpack('>I', read_exact(stream, 4))[0]
+    if size == 0:
+        raise DropError('malformed', 'Empty request frame')
+    if size > limit:
+        raise DropError('too_large', f'Request frame exceeds {limit} bytes')
+    return read_exact(stream, size)
+
+
+def decode_request(data):
+    try:
+        request = json.loads(data.decode('utf-8'))
+    except ValueError:
+        raise DropError('malformed', 'Request is not UTF-8 JSON') from None
+    if not isinstance(request, dict):
+        raise DropError('malformed', 'Request is not a JSON object')
+    return request
+
+
+def encode_frame(payload):
+    if not payload or len(payload) > MAX_REQUEST:
+        raise DropError('too_large', 'Request frame is empty or too large')
+    return struct.pack('>I', len(payload)) + payload
+
+
+def encode_request(request):
+    return encode_frame(json.dumps(request, separators=(',', ':')).encode('ascii'))
+
+
+def write_reply(stream, reply):
+    stream.write(json.dumps(reply, sort_keys=True).encode('ascii') + b'\n')
+    stream.flush()
+
+
+# --- validation --------------------------------------------------------------
+
+def require_thread(value):
+    if not isinstance(value, str) or not UUID_RE.fullmatch(value):
+        raise DropError('bad_thread', 'Thread must be an exact lowercase Codex UUID')
+    return value
+
+
+def require_socket(value):
+    if not isinstance(value, str) or not SOCKET_RE.fullmatch(value):
+        raise DropError('bad_socket', 'Invalid tmux socket label')
+    return value
+
+
+def require_host(value):
+    if not isinstance(value, str) or not HOST_RE.fullmatch(value):
+        raise DropError('bad_host', 'Invalid SSH host alias')
+    return value
+
+
+def image_kind(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
+
+def display_name(value):
+    if not isinstance(value, str):
+        return ''
+    base = re.split(r'[\\/]', value)[-1]
+    return clean_text(base, 120)
+
+
+def validate_images(items):
+    """Return decoded images; refuse anything malformed, oversized or not an image."""
+    if not isinstance(items, list) or not items:
+        raise DropError('no_images', 'No images supplied')
+    if len(items) > MAX_FILES:
+        raise DropError('too_many', f'At most {MAX_FILES} images per batch')
+    total = 0
+    images = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise DropError('malformed', f'Image {index + 1} is not an object')
+        size, digest, encoded = item.get('size'), item.get('sha256'), item.get('data')
+        if type(size) is not int or size <= 0:
+            raise DropError('malformed', f'Image {index + 1} has an invalid size')
+        if size > MAX_IMAGE:
+            raise DropError('too_large', f'Image {index + 1} exceeds {MAX_IMAGE} bytes')
+        total += size
+        if total > MAX_BATCH:
+            raise DropError('too_large', f'Batch exceeds {MAX_BATCH} bytes')
+        if not isinstance(digest, str) or not SHA_RE.fullmatch(digest):
+            raise DropError('malformed', f'Image {index + 1} has an invalid SHA256')
+        if not isinstance(encoded, str) or len(encoded) != 4 * ((size + 2) // 3):
+            raise DropError('truncated', f'Image {index + 1} data length does not match size')
+        try:
+            data = base64.b64decode(encoded.encode('ascii'), validate=True)
+        except ValueError:
+            raise DropError('malformed', f'Image {index + 1} is not strict base64') from None
+        if len(data) != size:
+            raise DropError('truncated', f'Image {index + 1} decoded to the wrong size')
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise DropError('hash_mismatch', f'Image {index + 1} SHA256 does not match')
+        kind = image_kind(data)
+        if not kind:
+            raise DropError('not_image', f'Image {index + 1} is not PNG, JPEG, GIF or WebP')
+        images.append(dict(index=index, name=display_name(item.get('name')), size=size,
+                           sha256=digest, kind=kind, data=data))
+    return images
+
+
+# --- private storage (home) --------------------------------------------------
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+
+def open_store():
+    """Open (creating 0700 if missing) the screenshot store without following links."""
+    home = os.path.expanduser('~')
+    if not os.path.isabs(home):
+        raise DropError('store_unsafe', 'Home directory is not absolute')
+    fd = os.open(home, DIR_FLAGS)
+    try:
+        for depth, part in enumerate(STORE_PARTS):
+            try:
+                child = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise DropError('store_unsafe', f'Store component {part} is not a plain directory') from None
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if info.st_uid != os.geteuid():
+                raise DropError('store_unsafe', f'Store component {part} is not owned by this user')
+            if depth >= PRIVATE_DEPTH and info.st_mode & 0o077:
+                raise DropError('store_unsafe', f'Store component {part} is not mode 0700')
+            if depth < PRIVATE_DEPTH and info.st_mode & 0o022:
+                raise DropError('store_unsafe', f'Store component {part} is group/world writable')
+        return fd, os.path.join(home, *STORE_PARTS)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def readback(dir_fd, name):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or \
+                stat.S_IMODE(info.st_mode) != 0o600:
+            raise DropError('store_unsafe', 'Saved file has unexpected type, owner or mode')
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_IMAGE:
+                raise DropError('readback_mismatch', 'Saved file grew beyond the limit')
+            digest.update(chunk)
+        return size, digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def store_images(images):
+    """Write one new private drop directory; remove it entirely on any failure."""
+    base_fd, base_path = open_store()
+    drop_name = time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(8)
+    drop_fd = None
+    made_dir = False
+    created = []
+    try:
+        os.mkdir(drop_name, 0o700, dir_fd=base_fd)
+        made_dir = True
+        drop_fd = os.open(drop_name, DIR_FLAGS | os.O_NOFOLLOW, dir_fd=base_fd)
+        os.fchmod(drop_fd, 0o700)
+        if os.fstat(drop_fd).st_uid != os.geteuid():
+            raise DropError('store_unsafe', 'Drop directory is not owned by this user')
+        results = []
+        for image in images:
+            name = f'{image["index"] + 1:02d}-{secrets.token_hex(6)}.{image["kind"]}'
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=drop_fd)
+            created.append(name)
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(image['data'])
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            size, digest = readback(drop_fd, name)
+            if size != image['size'] or digest != image['sha256']:
+                raise DropError('readback_mismatch', f'Saved image {image["index"] + 1} does not match')
+            results.append(dict(name=image['name'], size=size, sha256=digest, kind=image['kind'],
+                                path=f'{base_path}/{drop_name}/{name}', attach='not-attempted'))
+        os.fsync(drop_fd)
+        return results
+    except BaseException:
+        if drop_fd is not None:
+            for name in created:
+                try:
+                    os.unlink(name, dir_fd=drop_fd)
+                except OSError:
+                    pass
+        if made_dir:
+            try:
+                os.rmdir(drop_name, dir_fd=base_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if drop_fd is not None:
+            os.close(drop_fd)
+        os.close(base_fd)
+
+
+# --- exact target (home) -----------------------------------------------------
+
+def tmux(socket, *args, data=None, timeout=10):
+    extra = dict(input=data) if data is not None else dict(stdin=subprocess.DEVNULL)
+    try:
+        done = subprocess.run(['tmux', '-L', require_socket(socket), *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout, **extra)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise DropError('tmux_error', f'tmux failed: {type(error).__name__}') from None
+    if done.returncode != 0:
+        raise DropError('tmux_error', 'tmux: ' + clean_text(done.stderr.decode('utf-8', 'replace')))
+    return done.stdout.decode('utf-8', 'replace')
+
+
+def proc_stat(pid):
+    """Fields after the command name: [1]=ppid [2]=pgrp [4]=tty_nr [5]=tpgid [19]=start."""
+    with open(f'/proc/{pid}/stat', 'rb') as stream:
+        return stream.read().decode('ascii', 'replace').rsplit(')', 1)[1].split()
+
+
+def proc_argv(pid):
+    with open(f'/proc/{pid}/cmdline', 'rb') as stream:
+        return [os.fsdecode(arg) for arg in stream.read().split(b'\0') if arg]
+
+
+def children_map():
+    children = {}
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            parent = int(proc_stat(entry)[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(parent, []).append(int(entry))
+    return children
+
+
+def is_codex(pid, argv):
+    if {os.path.basename(arg) for arg in argv[:2]} & {'codex', 'codex.js'}:
+        return True
+    try:
+        return os.path.basename(os.readlink(f'/proc/{pid}/exe')) == 'codex'
+    except OSError:
+        return False
+
+
+def find_tui(pane_pid, thread, tty_rdev, children):
+    """Return the single foreground Codex `resume <thread>` leaf under the pane process."""
+    parents = {}
+    queue = [(pane_pid, 0)]
+    seen = {pane_pid}
+    candidates = []
+    while queue and len(seen) < 512:
+        pid, depth = queue.pop(0)
+        try:
+            argv = proc_argv(pid)
+            fields = proc_stat(pid)
+        except (OSError, IndexError):
+            argv, fields = [], []
+        if argv and fields and is_codex(pid, argv) and 'resume' in argv and thread in argv \
+                and fields[2] == fields[5] and int(fields[4]) == tty_rdev:
+            candidates.append((pid, fields[19]))
+        if depth < 16:
+            for child in children.get(pid, ()):
+                if child not in seen:
+                    seen.add(child)
+                    parents[child] = pid
+                    queue.append((child, depth + 1))
+
+    def under(pid, ancestor):
+        while pid in parents:
+            pid = parents[pid]
+            if pid == ancestor:
+                return True
+        return False
+
+    pids = [pid for pid, _ in candidates]
+    leaves = [item for item in candidates if not any(under(other, item[0]) for other in pids)]
+    if not leaves:
+        raise DropError('target_not_codex', 'The pane is not running Codex resume of this exact '
+                        'thread in the foreground (shell, Claude or a command is in front)')
+    if len(leaves) > 1:
+        raise DropError('target_ambiguous', 'More than one foreground Codex process matches')
+    return leaves[0]
+
+
+def discover_target(thread, socket):
+    """Find exactly one live Codex pane for the exact thread; return (target, in_mode)."""
+    require_thread(thread)
+    require_socket(socket)
+    matches = []
+    physical_rows = set()
+    for line in tmux(socket, 'list-panes', '-a', '-F', PANE_FORMAT).splitlines():
+        parts = line.split('\t', 7)
+        if len(parts) == 8 and parts[5] == thread:
+            physical = tuple(parts[:6])
+            if physical not in physical_rows:
+                physical_rows.add(physical)
+                matches.append(parts)
+    if not matches:
+        raise DropError('target_missing', 'No tmux pane is marked with this exact Codex thread')
+    if len(matches) > 1:
+        raise DropError('target_ambiguous', 'More than one tmux pane is marked with this thread')
+    pane, pane_pid, in_mode, window, tty, _, session, window_name = matches[0]
+    if not re.fullmatch(r'%\d+', pane) or not pane_pid.isdigit() or not re.fullmatch(r'@\d+', window) \
+            or not re.fullmatch(r'/dev/pts/\d+', tty):
+        raise DropError('target_missing', 'Unexpected tmux pane metadata')
+    tui_pid, tui_start = find_tui(int(pane_pid), thread, os.stat(tty).st_rdev, children_map())
+    target = dict(thread=thread, socket=socket, pane=pane, pane_pid=int(pane_pid), window=window,
+                  tui_pid=tui_pid, tui_start=tui_start, session=clean_text(session, 120),
+                  window_name=clean_text(window_name, 120))
+    return target, in_mode
+
+
+def target_token(target):
+    identity = {key: target[key] for key in IDENTITY_KEYS}
+    raw = json.dumps(identity, sort_keys=True, separators=(',', ':')).encode('ascii')
+    return base64.b64encode(raw).decode('ascii')
+
+
+def parse_token(token, thread, socket):
+    if not isinstance(token, str) or not token or len(token) > MAX_TOKEN:
+        raise DropError('bad_target', 'Missing confirmed target; refresh and confirm the target')
+    try:
+        data = json.loads(base64.b64decode(token.encode('ascii'), validate=True).decode('utf-8'))
+    except ValueError:
+        raise DropError('bad_target', 'Confirmed target token is malformed') from None
+    if not isinstance(data, dict) or set(data) != set(IDENTITY_KEYS) \
+            or data['thread'] != thread or data['socket'] != socket \
+            or not isinstance(data['pane'], str) or not re.fullmatch(r'%\d+', data['pane']) \
+            or not isinstance(data['window'], str) or not re.fullmatch(r'@\d+', data['window']) \
+            or type(data['pane_pid']) is not int or type(data['tui_pid']) is not int \
+            or not isinstance(data['tui_start'], str) or not data['tui_start'].isdigit():
+        raise DropError('bad_target', 'Confirmed target does not match this thread/socket')
+    return data
+
+
+def capture(socket, pane):
+    return tmux(socket, 'capture-pane', '-p', '-t', pane).split('\n')
+
+
+def composer_ready(lines, cursor_y):
+    """Accept a recognised Codex composer (draft allowed); refuse menus and approvals."""
+    rows = [index for index, line in enumerate(lines) if line.lstrip().startswith('›')]
+    if not rows:
+        raise DropError('target_not_ready', 'Codex composer prompt is not visible')
+    row = rows[-1]
+    if not row <= cursor_y <= row + 20:
+        raise DropError('target_not_ready', 'Cursor is not in the Codex composer')
+    if re.match('›\\s*\\d+\\.', lines[row].lstrip()):
+        raise DropError('target_confirmation', 'Codex is showing a selection menu')
+    context = '\n'.join(lines[max(0, row - 12):row] + lines[cursor_y + 1:]).lower()
+    for hint in APPROVAL_HINTS:
+        if hint in context:
+            raise DropError('target_confirmation', 'Codex is waiting on an approval/confirmation')
+
+
+def check_ready(target):
+    """Re-verify the whole confirmed tuple and composer; return the current screen."""
+    live, in_mode = discover_target(target['thread'], target['socket'])
+    for key in IDENTITY_KEYS:
+        if live[key] != target[key]:
+            raise DropError('target_changed', f'Target {key} changed; refresh and confirm again')
+    if in_mode != '0':
+        raise DropError('target_not_ready', 'Pane is in copy/view mode')
+    socket, pane = target['socket'], target['pane']
+    cursor = tmux(socket, 'display-message', '-p', '-t', pane, '#{cursor_y}').strip()
+    if not cursor.isdigit():
+        raise DropError('target_not_ready', 'Cannot read the pane cursor')
+    lines = capture(socket, pane)
+    composer_ready(lines, int(cursor))
+    return live, lines
+
+
+def mark_state(lines):
+    numbers = [int(value) for value in IMAGE_MARK_RE.findall('\n'.join(lines))]
+    return len(numbers), max(numbers, default=0)
+
+
+def paste_path(socket, pane, path):
+    """Bracketed-paste one absolute path via a private buffer. Never sends Enter."""
+    if not SAFE_PATH_RE.fullmatch(path):
+        raise DropError('attach_blocked', 'Saved path has characters unsafe for pasting')
+    name = 'codex-drop-' + secrets.token_hex(8)
+    tmux(socket, 'load-buffer', '-b', name, '-', data=path.encode('ascii'))
+    try:
+        tmux(socket, 'paste-buffer', '-p', '-d', '-b', name, '-t', pane)
+    except DropError:
+        try:
+            tmux(socket, 'delete-buffer', '-b', name)
+        except DropError:
+            pass
+        raise
+
+
+def wait_for_new_mark(socket, pane, before, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        time.sleep(0.15)
+        after = mark_state(capture(socket, pane))
+        if after[0] > before[0] or after[1] > before[1]:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+
+
+def public_target(target):
+    return {key: target[key] for key in IDENTITY_KEYS + ('session', 'window_name')}
+
+
+# --- home request handlers ---------------------------------------------------
+
+def handle_target(thread, socket):
+    target, _ = discover_target(thread, socket)
+    try:
+        check_ready(target)
+        composer = 'ready'
+    except DropError as error:
+        composer = 'not ready: ' + error.message
+    return dict(ok=True, op='target', target=public_target(target),
+                target_token=target_token(target), composer=composer)
+
+
+def codex_process(executable, argv):
+    """Exact executable/wrapper names, never a substring of a shell command."""
+    names = {os.path.basename(executable.removesuffix(' (deleted)'))}
+    names.update(os.path.basename(arg) for arg in argv[:2])
+    return bool(names & {'codex', 'codex.js', 'codex.exe'}) or any(re.fullmatch(
+        r'codex-(?:x86_64|aarch64)-(?:unknown-linux-(?:musl|gnu)|apple-darwin|pc-windows-msvc)(?:\.exe)?',
+        name) for name in names)
+
+
+def scan_processes(root=Path('/proc'), clock=time.monotonic, max_entries=8192):
+    """No argv leaves this bounded, read-only scan. Unknown means cleanup holds."""
+    deadline, count, present = clock() + 2, 0, False
+    def bounded(path, limit):
+        with open(path, 'rb') as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError('process metadata bound')
+        return raw
+    def start_time(raw):
+        fields = raw.rsplit(b')', 1)[1].split()
+        if len(fields) < 20 or not fields[19].isdigit():
+            raise ValueError('process metadata shape')
+        return fields[19]
+    def user_ids(raw):
+        rows = [line.split()[1:] for line in raw.splitlines() if line.startswith(b'Uid:')]
+        if len(rows) != 1 or len(rows[0]) != 4 or any(
+                not value.isdigit() or int(value) >= 4294967295 for value in rows[0]):
+            raise ValueError('process credentials unknown')
+        return tuple(map(int, rows[0][:2]))
+    try:
+        # Restrictive procfs views cannot prove that a process is absent.
+        mounts = bounded(Path(root) / 'self/mountinfo', 256 * 1024).splitlines()
+        proc_mounts = []
+        for line in mounts:
+            left, right = line.split(b' - ', 1)
+            fields, filesystem = left.split(), right.split()
+            if len(fields) < 6 or len(filesystem) < 3:
+                raise ValueError('mount metadata shape')
+            if filesystem[0] == b'proc':
+                options = set(fields[5].split(b',')) | set(filesystem[2].split(b','))
+                proc_mounts.append(options)
+        if not proc_mounts or any(b'subset=pid' in options or any(
+                option.startswith(b'hidepid=') and option not in (b'hidepid=0', b'hidepid=off')
+                for option in options) for options in proc_mounts):
+            raise ValueError('restricted process view')
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if clock() >= deadline:
+                    return dict(process_complete=False, codex_present=present)
+                if not entry.name.isdecimal():
+                    continue
+                count += 1
+                if count > max_entries:
+                    return dict(process_complete=False, codex_present=present)
+                try:
+                    before = entry.stat(follow_symlinks=False)
+                    if not stat.S_ISDIR(before.st_mode):
+                        raise ValueError('process entry type')
+                    path = Path(root) / entry.name
+                    credentials = user_ids(bounded(path / 'status', 65536))
+                    if os.geteuid() not in credentials:
+                        continue
+                    started = start_time(bounded(path / 'stat', 8192))
+                    argv = [os.fsdecode(value) for value in bounded(path / 'cmdline', 65536).split(b'\0') if value]
+                    if not argv:
+                        state = bounded(path / 'stat', 8192).rsplit(b')', 1)[1].split()[0]
+                        if state in (b'Z', b'X'):
+                            # The group leader may exit before its other
+                            # threads; only a lone dead task has no draft.
+                            seen_self = False
+                            with os.scandir(path / 'task') as tasks:
+                                for task in tasks:
+                                    if clock() >= deadline or task.name != entry.name:
+                                        raise ValueError('live threads behind zombie leader')
+                                    seen_self = True
+                            if not seen_self:
+                                raise ValueError('dead task state unknown')
+                            continue
+                        raise ValueError('live process arguments unknown')
+                    try:
+                        executable = os.readlink(path / 'exe')
+                    except PermissionError:
+                        # Non-dumpable same-user processes expose credentials
+                        # and argv but can hide exe (including native Codex).
+                        executable = ''
+                    if len(os.fsencode(executable)) > 4096:
+                        raise ValueError('process executable bound')
+                    after = os.stat(path, follow_symlinks=False)
+                    if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or
+                            started != start_time(bounded(path / 'stat', 8192)) or
+                            credentials != user_ids(bounded(path / 'status', 65536))):
+                        raise ValueError('process changed')
+                    present = present or codex_process(executable, argv)
+                except FileNotFoundError:
+                    continue  # A vanished process cannot retain a native draft.
+        if clock() >= deadline:
+            return dict(process_complete=False, codex_present=present)
+        return dict(process_complete=True, codex_present=present)
+    except (OSError, ValueError, IndexError):
+        return dict(process_complete=False, codex_present=present)
+
+
+def raw_catalog(socket):
+    """Raw labelled-pane presence, with no target/composer inspection."""
+    require_socket(socket)
+    try:
+        raw = tmux(socket, 'list-panes', '-a', '-F', PANE_FORMAT)
+    except DropError:
+        return dict(ok=True, op='catalog', tmux_ok=False, complete=False,
+                    truncated=False, threads=[], chats=[])
+    if len(raw.encode('utf-8')) > MAX_REPLY:
+        return dict(ok=True, op='catalog', tmux_ok=True, complete=False,
+                    truncated=True, threads=[], chats=[])
+    threads, complete = set(), True
+    for line in raw.splitlines():
+        parts = line.split('\t', 7)
+        if len(parts) != 8:
+            complete = False
+            continue
+        if not parts[5]:
+            continue
+        try:
+            threads.add(require_thread(parts[5]))
+        except DropError:
+            complete = False
+    ordered = sorted(threads)
+    truncated = len(ordered) > 64
+    if truncated:
+        complete = False
+    ordered = ordered[:64]
+    return dict(ok=True, op='catalog', tmux_ok=True, complete=complete,
+                truncated=truncated, threads=ordered, chats=[])
+
+
+def handle_presence(socket):
+    result = raw_catalog(socket)
+    result.update(scan_processes(), op='presence')
+    return result
+
+
+def handle_catalog(socket):
+    """Selectable UI targets never replace raw presence for cleanup."""
+    result = raw_catalog(socket)
+    if result['tmux_ok'] is not True:
+        return result
+    chats = []
+    deadline = time.monotonic() + 8
+    for thread in result['threads']:
+        if time.monotonic() >= deadline:
+            result.update(truncated=True, complete=False)
+            break
+        try:
+            reply = handle_target(thread, socket)
+        except (DropError, OSError):
+            # Busy, ambiguous, shell foreground and unavailable targets remain
+            # in raw `threads`; none of these is evidence for deletion.
+            continue
+        chats.append(dict(target=reply['target'], composer=reply['composer']))
+    result['chats'] = chats
+    return result
+
+
+def handle_inspect(thread, socket):
+    require_thread(thread)
+    catalog = handle_presence(socket)
+    if thread in catalog['threads']:
+        entry = next((item for item in catalog['chats'] if item['target']['thread'] == thread), None)
+        # The visible editor can be empty while Codex retains queued local
+        # image paths. No screen heuristic establishes zero pending references.
+        return dict(ok=True, op='inspect', present=True, definite=False,
+                    composer=entry['composer'] if entry else 'unavailable',
+                    draft_image_marks=None, reason='pending_input_state_unavailable')
+    definite = (catalog.get('tmux_ok') is True and catalog.get('complete') is True and
+                catalog.get('truncated') is False and catalog.get('process_complete') is True and
+                catalog.get('codex_present') is False)
+    return dict(ok=True, op='inspect', present=False if definite else None,
+                definite=definite, composer='absent' if definite else 'unknown',
+                draft_image_marks=0 if definite else None)
+
+
+def handle_upload(request, thread, socket):
+    target = parse_token(request.get('target_token'), thread, socket)
+    images = validate_images(request.get('images'))
+    files = store_images(images)
+    result = dict(ok=True, op='upload', status='transferred', files=files)
+    if request.get('attach', True) is False:
+        result['attach'] = dict(state='skipped', message='Attachment not requested')
+        return result
+    try:
+        for item in files:
+            live, lines = check_ready(target)
+            result['target'] = public_target(live)
+            before = mark_state(lines)
+            item['attach'] = 'pasting'
+            paste_path(socket, target['pane'], item['path'])
+            if not wait_for_new_mark(socket, target['pane'], before):
+                item['attach'] = 'pasted-unverified'
+                result['attach'] = dict(
+                    state='unverified', code='attach_unverified',
+                    message='Path was pasted but no new [Image #N] appeared. The path text may be '
+                            'in the composer; nothing was sent. Remaining images were not pasted.')
+                return result
+            item['attach'] = 'attached-verified'
+    except DropError as error:
+        for item in files:
+            if item['attach'] == 'pasting':
+                item['attach'] = 'paste-uncertain'
+        result['attach'] = dict(state='blocked', code=error.code, message=error.message)
+        return result
+    result['status'] = 'transferred+attached-verified'
+    result['attach'] = dict(state='verified', message='Attached in Codex; review and send it yourself')
+    return result
+
+
+def handle_receive(request):
+    if request.get('version') != VERSION:
+        raise DropError('bad_version', 'Unsupported protocol version')
+    op = request.get('op')
+    if op not in OPS + READ_ONLY_HOME_OPS:
+        raise DropError('bad_op', 'Unknown operation')
+    socket = require_socket(request.get('socket'))
+    if op in ('catalog', 'presence'):
+        if set(request) != {'version', 'op', 'socket'}:
+            raise DropError('malformed', 'Catalog does not accept a target or command')
+        return handle_catalog(socket) if op == 'catalog' else handle_presence(socket)
+    thread = require_thread(request.get('thread'))
+    if op == 'inspect':
+        if set(request) != {'version', 'op', 'socket', 'thread'}:
+            raise DropError('malformed', 'Inspection does not accept input or commands')
+        return handle_inspect(thread, socket)
+    if op == 'test_route':
+        return dict(ok=True, op=op, receiver='ready', version=VERSION)
+    if op == 'target':
+        return handle_target(thread, socket)
+    return handle_upload(request, thread, socket)
+
+
+# --- work-side client --------------------------------------------------------
+
+def quote_join(args):
+    return ' '.join(shlex.quote(arg) for arg in args)
+
+
+def nested_argv(bastion, home, command, stdin=True):
+    flag = [] if stdin else ['-n']
+    inner = quote_join(['ssh', *flag, *SSH_OPTIONS, home, command])
+    return ['ssh', *flag, *SSH_OPTIONS, bastion, inner]
+
+
+def run_bounded(argv, data, timeout, limit):
+    """Run argv with optional stdin bytes; bound runtime, stdout and stderr."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        raise DropError('ssh_missing', f'Cannot start {argv[0]}: {error.strerror}') from None
+    out, err = bytearray(), bytearray()
+    overflow = []
+
+    def drain(stream, buffer, cap, mark):
+        while True:
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            room = cap - len(buffer)
+            if len(chunk) > room and mark:
+                overflow.append(True)
+            buffer.extend(chunk[:max(room, 0)])
+        stream.close()
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    workers = [threading.Thread(target=drain, args=(proc.stdout, out, limit, True), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, err, 65536, False), daemon=True)]
+    if data is not None:
+        workers.append(threading.Thread(target=feed, daemon=True))
+    for worker in workers:
+        worker.start()
+    timed_out = False
+    try:
+        code = proc.wait(timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        code = proc.wait()
+        timed_out = True
+    for worker in workers:
+        worker.join(10)
+    return code, bytes(out), bytes(err), timed_out, bool(overflow)
+
+
+def classify_ssh(stderr, hop):
+    text = stderr.lower()
+    if any(hint in text for hint in ('host key verification failed', 'remote host identification',
+                                     'no matching host key', 'host key for')):
+        return f'{hop}_hostkey'
+    if any(hint in text for hint in ('permission denied', 'too many authentication failures',
+                                     'no supported authentication')):
+        return f'{hop}_auth'
+    if any(hint in text for hint in ('could not resolve', 'timed out', 'connection refused',
+                                     'no route to host', 'network is unreachable')):
+        return f'{hop}_unreachable'
+    return f'{hop}_ssh'
+
+
+def ssh_error(code, stderr):
+    detail = clean_text(stderr, 200)
+    return DropError(code, SSH_MESSAGES[code] + (f' ({detail})' if detail else ''))
+
+
+def probe_route(bastion, home):
+    """Distinguish Bastion and home auth/host-key/reachability failures."""
+    code, _, err, timed_out, _ = run_bounded(['ssh', '-n', *SSH_OPTIONS, bastion, 'true'],
+                                             None, 30, 4096)
+    if timed_out:
+        raise ssh_error('bastion_unreachable', 'timed out')
+    if code != 0:
+        raise ssh_error(classify_ssh(err.decode('utf-8', 'replace'), 'bastion'),
+                        err.decode('utf-8', 'replace'))
+    code, _, err, timed_out, _ = run_bounded(nested_argv(bastion, home, 'true', stdin=False),
+                                             None, 45, 4096)
+    if timed_out:
+        raise ssh_error('home_unreachable', 'timed out')
+    if code != 0:
+        raise ssh_error(classify_ssh(err.decode('utf-8', 'replace'), 'home'),
+                        err.decode('utf-8', 'replace'))
+
+
+def call_receiver(bastion, home, payload, timeout):
+    code, out, err, timed_out, overflow = run_bounded(
+        nested_argv(bastion, home, REMOTE_COMMAND), payload, timeout, MAX_REPLY)
+    if overflow:
+        raise DropError('reply_too_large', 'Home reply exceeded the size limit')
+    lines = [line for line in out.decode('utf-8', 'replace').splitlines() if line.strip()]
+    if lines:
+        try:
+            reply = json.loads(lines[-1])
+        except ValueError:
+            reply = None
+        if isinstance(reply, dict):
+            return reply
+    if timed_out:
+        raise DropError('timeout', 'Home did not answer in time; the result is uncertain. '
+                        'Check the Codex composer before retrying.')
+    errtext = err.decode('utf-8', 'replace')
+    if code == 255:
+        probe_route(bastion, home)
+        raise DropError('ssh_error', 'SSH failed: ' + clean_text(errtext))
+    low = errtext.lower()
+    if code in (126, 127) or "can't open file" in low or 'no such file' in low \
+            or 'command not found' in low:
+        raise DropError('receiver_missing', f'Home receiver {RECEIVER} or python3 is missing')
+    raise DropError('receiver_failed', 'Home receiver failed: ' + clean_text(errtext))
+
+
+def handle_client(request):
+    if request.get('version') != VERSION:
+        raise DropError('bad_version', 'Unsupported protocol version')
+    op = request.get('op')
+    if op not in OPS:
+        raise DropError('bad_op', 'Unknown operation')
+    thread = require_thread(request.get('thread'))
+    socket = require_socket(request.get('socket'))
+    bastion = require_host(request.get('bastion', 'bastion'))
+    home = require_host(request.get('home', 'home'))
+    forward = dict(version=VERSION, op=op, thread=thread, socket=socket)
+    timeout = 60
+    if op == 'upload':
+        parse_token(request.get('target_token'), thread, socket)
+        validate_images(request.get('images'))  # local check before any network use
+        forward.update(target_token=request['target_token'], images=request['images'],
+                       attach=request.get('attach', True) is not False)
+        timeout = 600
+    if op == 'test_route':
+        probe_route(bastion, home)
+    reply = call_receiver(bastion, home, encode_request(forward), timeout)
+    reply['route'] = f'{bastion} > {home}'
+    return reply
+
+
+def serve(handler):
+    try:
+        reply = handler(decode_request(read_frame(sys.stdin.buffer)))
+    except DropError as error:
+        reply = error_reply(error.code, error.message)
+    except Exception as error:  # structured reply instead of a traceback on stdout
+        reply = error_reply('internal', clean_text(f'{type(error).__name__}: {error}'))
+    write_reply(sys.stdout.buffer, reply)
+    return 0 if reply.get('ok') else 1
+
+
+# --- bundle (home) -----------------------------------------------------------
+
+CLIENT_PLACEHOLDER = '__CODEX_DROP_CLIENT_B64__'
+CONFIG_PLACEHOLDER = '__CODEX_DROP_CONFIG_B64__'
+
+
+def build_bundle(template, source, config):
+    """Return deterministic ASCII PS1 bytes with the client and config embedded."""
+    try:
+        text = template.decode('ascii')
+    except UnicodeDecodeError:
+        raise DropError('bad_template', 'Template must be ASCII for Windows PowerShell 5.1') from None
+    for placeholder in (CLIENT_PLACEHOLDER, CONFIG_PLACEHOLDER):
+        if text.count(placeholder) != 1:
+            raise DropError('bad_template', f'Template must contain {placeholder} exactly once')
+    config_raw = json.dumps(config, sort_keys=True, separators=(',', ':')).encode('ascii')
+    text = text.replace(CLIENT_PLACEHOLDER, base64.b64encode(source).decode('ascii'))
+    text = text.replace(CONFIG_PLACEHOLDER, base64.b64encode(config_raw).decode('ascii'))
+    return text.encode('ascii')
+
+
+def bootstrap_text(digest, bastion, home, remote_path):
+    """One-time Windows PowerShell paste: fetch, pin hash, create exclusively, launch hidden."""
+    options = ' '.join(SSH_OPTIONS)
+    fetch = (f'-e ssh -n {options} {bastion} "ssh -n {options} {home} base64 -w0 {remote_path}"')
+    return '\n'.join((
+        "& {",
+        "$ErrorActionPreference = 'Stop'",
+        f"$want = '{digest}'",
+        "$dir = Join-Path $env:LOCALAPPDATA 'CodexDrop'",
+        "$file = Join-Path $dir 'CodexDrop.ps1'",
+        "function Get-Hex([byte[]]$b) { $s = [Security.Cryptography.SHA256]::Create(); "
+        "-join ($s.ComputeHash($b) | ForEach-Object { $_.ToString('x2') }) }",
+        "$psi = New-Object Diagnostics.ProcessStartInfo 'wsl.exe'",
+        f"$psi.Arguments = '{fetch}'",
+        "$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true",
+        "$psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true",
+        "$proc = [Diagnostics.Process]::Start($psi)",
+        "$out = $proc.StandardOutput.ReadToEndAsync(); $err = $proc.StandardError.ReadToEndAsync()",
+        "if (-not $proc.WaitForExit(120000)) { $proc.Kill(); throw 'CodexDrop fetch timed out' }",
+        "if ($proc.ExitCode -ne 0) { throw ('CodexDrop fetch failed: ' + $err.Result) }",
+        "$bytes = [Convert]::FromBase64String($out.Result.Trim())",
+        "$got = Get-Hex $bytes",
+        "if ($got -ne $want) { throw \"CodexDrop hash mismatch: $got\" }",
+        "if (Test-Path -LiteralPath $dir) { if ((Get-Item -LiteralPath $dir -Force).Attributes "
+        "-band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked CodexDrop folder' } }",
+        "else { New-Item -ItemType Directory -Path $dir | Out-Null }",
+        "if (Test-Path -LiteralPath $file) {",
+        "  if ((Get-Item -LiteralPath $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) "
+        "{ throw 'Refusing linked CodexDrop.ps1' }",
+        "  if ((Get-Hex ([IO.File]::ReadAllBytes($file))) -ne $want) "
+        "{ throw \"Different $file exists; not replaced\" }",
+        "} else {",
+        "  $w = New-Object IO.FileStream($file, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, "
+        "[IO.FileShare]::None)",
+        "  try { $w.Write($bytes, 0, $bytes.Length) } finally { $w.Close() }",
+        "}",
+        "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-STA', "
+        "'-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ('\"' + $file + '\"'))",
+        "}",
+    ))
+
+
+LATER_LAUNCH = ('powershell -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden '
+                '-File "%LOCALAPPDATA%\\CodexDrop\\CodexDrop.ps1"')
+
+
+def write_private(path, data):
+    directory, name = os.path.split(os.path.abspath(path))
+    temp = os.path.join(directory, f'.{name}.tmp-{secrets.token_hex(6)}')
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def run_bundle(args):
+    source_path = os.path.realpath(__file__)
+    template_path = args.template or os.path.join(
+        os.path.dirname(source_path), '..', 'share', 'codex-drop', 'CodexDrop.ps1')
+    output = os.path.abspath(args.output)
+    remote_path = args.remote_path or output
+    if os.path.realpath(template_path) == os.path.realpath(output):
+        raise DropError('bad_output', 'Output must not overwrite the template')
+    if not SAFE_PATH_RE.fullmatch(remote_path):
+        raise DropError('bad_output', 'Remote bundle path must be a plain absolute path')
+    config = dict(version=VERSION, thread=require_thread(args.thread),
+                  socket=require_socket(args.socket), bastion=require_host(args.bastion),
+                  home=require_host(args.home))
+    with open(template_path, 'rb') as stream:
+        template = stream.read()
+    with open(source_path, 'rb') as stream:
+        source = stream.read()
+    bundle = build_bundle(template, source, config)
+    write_private(output, bundle)
+    digest = hashlib.sha256(bundle).hexdigest()
+    print(f'bundle {output}')
+    print(f'sha256 {digest}')
+    print('One-time bootstrap: paste into an ordinary Windows PowerShell window (not WSL):')
+    print(bootstrap_text(digest, args.bastion, args.home, remote_path))
+    print('Later launch (Run box or shortcut):')
+    print(LATER_LAUNCH)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='codex-drop', description=__doc__.splitlines()[0])
+    modes = parser.add_subparsers(dest='mode', required=True)
+    modes.add_parser('client', help='work WSL: forward one framed request over nested SSH')
+    modes.add_parser('receive', help='home: handle one framed request')
+    target = modes.add_parser('target', help='home: show the live Codex target tuple')
+    target.add_argument('--thread', required=True)
+    target.add_argument('--socket', required=True)
+    bundle = modes.add_parser('bundle', help='home: generate the Windows drop window')
+    bundle.add_argument('--thread', required=True)
+    bundle.add_argument('--socket', required=True)
+    bundle.add_argument('--output', required=True)
+    bundle.add_argument('--template')
+    bundle.add_argument('--remote-path')
+    bundle.add_argument('--bastion', default='bastion')
+    bundle.add_argument('--home', default='home')
+    args = parser.parse_args(argv)
+    if args.mode == 'client':
+        return serve(handle_client)
+    if args.mode == 'receive':
+        return serve(handle_receive)
+    try:
+        if args.mode == 'target':
+            reply = handle_target(require_thread(args.thread), require_socket(args.socket))
+            print(json.dumps(reply, sort_keys=True, indent=2))
+            return 0
+        return run_bundle(args)
+    except DropError as error:
+        print(json.dumps(error_reply(error.code, error.message), sort_keys=True))
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

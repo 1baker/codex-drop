@@ -1,0 +1,32 @@
+# User content, credentials and deployment state never belong in source control.
+.env
+.env.*
+config.json
+screenshots/
+state/
+runtime/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.heic
+CodexDrop-work.ps1
+
+# Generated files and local dependencies.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+*.log
+coverage/
+dist/

@@ -1,0 +1,35 @@
+[Unit]
+Description=Private screenshot drop adapter for the existing Codex draft
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStartPre=+/usr/bin/python3 -I %h/.local/bin/codex-drop-web --check-ancestors --config %h/.config/codex-drop-web/config.json
+ExecStart=/usr/bin/python3 -I %h/.local/bin/codex-drop-web --config %h/.config/codex-drop-web/config.json
+WorkingDirectory=%h
+Environment=PATH=/usr/bin:/bin
+UMask=0077
+StateDirectory=codex-drop-web
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/codex-drop-web %h/.local/share/codex-drop/screenshots
+PrivateTmp=no
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+MemoryMax=1280M
+TasksMax=16
+TimeoutStopSec=135
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,1602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="same-origin">
+<meta name="color-scheme" content="light dark">
+<title>Codex Drop</title>
+<style>
+:root {
+  --bg: #f5f6f8; --card: #ffffff; --text: #1b1f24; --muted: #5b6470; --line: #d6dae0;
+  --accent: #2457d6; --accent-text: #ffffff; --ok: #1d7a3a; --warn: #9a5b00; --bad: #b42318;
+  --zone: #eef3ff; --zone-active: #dbe6ff; --radius: 12px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --card: #1a1f25; --text: #e7eaee; --muted: #9aa4b0; --line: #2f3742;
+    --accent: #6d95ff; --accent-text: #0b1020; --ok: #57c47a; --warn: #f0b252; --bad: #ff7a6e;
+    --zone: #182235; --zone-active: #22314d;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+}
+main { max-width: 860px; margin: 0 auto; display: grid; gap: 12px; }
+header h1 { margin: 4px 0 0; font-size: 1.4rem; }
+header p { margin: 2px 0 0; color: var(--muted); font-size: .95rem; }
+section.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+section.card h2 { margin: 0 0 8px; font-size: 1.1rem; }
+.strip-top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; justify-content: space-between; }
+.state { font-weight: 600; margin: 0; flex: 1 1 260px; }
+.badge { font-size: .8rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.message { margin: 6px 0 0; }
+.error { margin: 6px 0 0; color: var(--bad); font-weight: 600; white-space: pre-wrap; }
+.error:empty, .message:empty, .hint:empty { display: none; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.dest { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+.dest label { font-weight: 600; }
+.dest select { flex: 1 1 220px; min-width: 0; }
+button, select {
+  font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  padding: 10px 14px; min-height: 44px;
+}
+button { cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.target-name { margin: 8px 0 0; overflow-wrap: anywhere; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0 0; font-size: .9rem; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.zone {
+  border: 2px dashed var(--accent); background: var(--zone); border-radius: var(--radius);
+  padding: 28px 16px; text-align: center; display: grid; gap: 12px; justify-items: center;
+}
+.zone.dragging { background: var(--zone-active); border-style: solid; }
+.zone.disabled { opacity: .6; }
+.zone p { margin: 0; }
+.hint { color: var(--muted); font-size: .9rem; }
+.only-desktop { display: block; }
+@media (hover: none) and (pointer: coarse) { .only-desktop { display: none; } .zone { padding: 18px 12px; } }
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+ul.queue { list-style: none; margin: 12px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+ul.queue:empty { display: none; }
+ul.queue li { border: 1px solid var(--line); border-radius: 10px; padding: 8px; display: grid; gap: 6px; }
+ul.queue img { width: 100%; height: 110px; object-fit: cover; border-radius: 6px; background: var(--zone); }
+ul.queue .name { font-size: .85rem; overflow-wrap: anywhere; }
+ul.queue .size { font-size: .8rem; color: var(--muted); }
+ul.queue button { min-height: 44px; padding: 6px 10px; font-size: .85rem; }
+.totals { color: var(--muted); font-size: .9rem; margin: 8px 0 0; }
+.op { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-top: 10px; }
+.op h3 { margin: 0 0 6px; font-size: 1rem; }
+.op ul { margin: 6px 0 0; padding-left: 18px; }
+.op li { margin: 4px 0; overflow-wrap: anywhere; }
+.op p { margin: 4px 0 0; }
+ul.incidents { margin: 8px 0 0; padding-left: 18px; }
+ul.incidents li { margin: 4px 0; overflow-wrap: anywhere; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; overflow-wrap: anywhere; }
+.ok { color: var(--ok); font-weight: 600; }
+.warn { color: var(--warn); font-weight: 600; }
+.bad { color: var(--bad); font-weight: 600; }
+.recovery { border-color: var(--warn); }
+label.ack { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; min-height: 44px; }
+label.ack input { width: 24px; height: 24px; margin-top: 2px; flex: none; }
+details summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; }
+.storage p { margin: 6px 0 0; }
+footer { color: var(--muted); font-size: .85rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Codex Drop</h1>
+    <p>Attach screenshots to an existing Codex draft on your home computer. Nothing is sent for you; review and send the draft in Codex yourself.</p>
+  </header>
+
+  <section class="card" aria-labelledby="status-heading">
+    <h2 id="status-heading" class="visually-hidden">Status and destination</h2>
+    <div class="strip-top">
+      <p id="state" class="state" role="status" aria-live="polite">Starting…</p>
+      <span id="session-badge" class="badge" hidden></span>
+    </div>
+    <p id="message" class="message" aria-live="polite"></p>
+    <p id="error" class="error" role="alert"></p>
+    <div class="row" id="connect-row">
+      <button type="button" id="connect">Connect</button>
+    </div>
+    <div class="dest">
+      <label for="chat-select">Chat</label>
+      <select id="chat-select" disabled></select>
+      <button type="button" id="use-chat" class="primary">Use this chat</button>
+    </div>
+    <p id="target-summary" class="target-name">No chat loaded yet.</p>
+    <details id="target-details">
+      <summary>Chat details</summary>
+      <dl id="target-facts" class="facts"></dl>
+      <div class="row">
+        <button type="button" id="refresh-target">Refresh chat list</button>
+      </div>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="drop-heading">
+    <h2 id="drop-heading" class="visually-hidden">Screenshots</h2>
+    <div id="zone" class="zone">
+      <p class="only-desktop"><strong>Drag screenshots here</strong> or paste them</p>
+      <button type="button" id="choose" class="primary">Choose screenshots</button>
+      <input type="file" id="picker" class="visually-hidden" multiple accept="image/png,image/jpeg,image/gif,image/webp" tabindex="-1" aria-hidden="true">
+      <p class="hint" id="limits-hint">PNG, JPEG, GIF or WebP. HEIC is not supported.</p>
+    </div>
+    <ul id="queue" class="queue" aria-label="Selected screenshots"></ul>
+    <p id="totals" class="totals"></p>
+    <div class="row">
+      <button type="button" id="attach" class="primary">Attach selected</button>
+      <button type="button" id="clear">Clear</button>
+    </div>
+  </section>
+
+  <section class="card recovery" id="recovery" aria-labelledby="recovery-heading" hidden>
+    <h2 id="recovery-heading">Check the draft before uploading again</h2>
+    <p id="recovery-text">An upload was not confirmed as attached. Your screenshots are still queued and nothing will be retried automatically.</p>
+    <ul id="incidents" class="incidents"></ul>
+    <div class="row">
+      <button type="button" id="inspect">Check upload status</button>
+    </div>
+    <div id="inspected"></div>
+    <label class="ack">
+      <input type="checkbox" id="ack">
+      <span>I checked every affected Codex draft listed below. Mark these uploads as checked; this does not mean they attached.</span>
+    </label>
+    <div class="row">
+      <button type="button" id="allow-new">Mark checked and allow a new upload</button>
+    </div>
+  </section>
+
+  <section class="card" id="result-card" aria-labelledby="result-heading" hidden>
+    <h2 id="result-heading">Last result</h2>
+    <div id="result"></div>
+  </section>
+
+  <section class="card" aria-labelledby="recent-heading">
+    <details id="recent-details">
+      <summary id="recent-heading">Storage and recent receipts</summary>
+      <div class="storage">
+        <p id="retention" class="hint"></p>
+        <p id="capacity" class="hint"></p>
+      </div>
+      <div id="recent"></div>
+    </details>
+  </section>
+
+  <footer>Private tailnet page. Saved screenshots become eligible for cleanup after 7 days. Running Codex processes or incomplete safety checks keep screenshots longer.</footer>
+</main>
+<script>
+(function () {
+  'use strict';
+
+  var PROTOCOL = 2;
+  var RETENTION_DAYS = 7;
+  var MAX_CHATS = 64;
+  var TICK_MS = 30000;
+  var RESUME_MIN_MS = 3000;
+  var RENEW_MARGIN_MS = 30000;
+  var MIB = 1024 * 1024;
+  var DEFAULT_LIMITS = Object.freeze({ max_files: 10, max_image: 25 * MIB, max_batch: 50 * MIB });
+  var ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  var ALLOWED_EXT = /\.(png|jpe?g|gif|webp)$/i;
+  var HEIC_RE = /\.(heic|heif)$/i;
+  var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  var SUCCESS_MESSAGE = 'Attached to Codex draft; review and send there yourself.';
+  var RECOVERY_HINT = 'Your screenshots are still queued and nothing will be retried automatically. Check the Codex draft, then mark the upload as checked to allow a new one.';
+  var RELOAD_MESSAGE = 'This page is out of date for the home computer. Reload the page; nothing was sent.';
+  var STILL_QUEUED = 'Your screenshots are still queued.';
+  // Upload refusals the API contract defines as happening before any receiver
+  // dispatch. Everything else keeps the operation ID as an open uncertainty.
+  var DEFINITE_REFUSALS = { protocol_reload: true, session: true, busy: true, target_changed: true };
+  var TRANSIENT_ERRORS = { network: true, session: true, session_failed: true, chats_failed: true, receipts_failed: true, not_connected: true };
+
+  // ---- Pure helpers -------------------------------------------------------
+
+  function fileType(file) { return String((file && file.type) || '').toLowerCase(); }
+  function fileName(file) { return String((file && file.name) || ''); }
+
+  function isHeic(file) {
+    var t = fileType(file);
+    return t === 'image/heic' || t === 'image/heif' || HEIC_RE.test(fileName(file));
+  }
+
+  function allowedFile(file) {
+    if (!file || typeof file !== 'object') return false;
+    if (isHeic(file)) return false;
+    var type = fileType(file);
+    if (type) return ALLOWED_TYPES.indexOf(type) !== -1;
+    return ALLOWED_EXT.test(fileName(file));
+  }
+
+  function verified(operation) {
+    if (!operation || operation.state !== 'completed') return false;
+    var r = operation.result;
+    if (!r || r.ok !== true || !r.attach || r.attach.state !== 'verified') return false;
+    if (!Array.isArray(r.files) || r.files.length === 0) return false;
+    return r.files.every(function (f) { return !!f && f.attach === 'attached-verified'; });
+  }
+
+  // An acknowledgement only records that the user checked the draft; it never
+  // turns an operation into an attachment.
+  function acknowledged(operation) {
+    var r = operation && operation.resolution;
+    return !!r && typeof r === 'object' && r.state === 'acknowledged';
+  }
+
+  function isIncident(operation) {
+    return !!operation && typeof operation === 'object' && !verified(operation) && !acknowledged(operation);
+  }
+
+  function needsAcknowledgement(operations, unresolvedCount) {
+    if (Array.isArray(operations) && operations.some(isIncident)) return true;
+    return typeof unresolvedCount === 'number' && unresolvedCount > 0;
+  }
+
+  function stableJson(v) {
+    if (v === null || v === undefined || typeof v !== 'object') return JSON.stringify(v === undefined ? null : v);
+    if (Array.isArray(v)) return '[' + v.map(stableJson).join(',') + ']';
+    return '{' + Object.keys(v).sort().map(function (k) { return JSON.stringify(k) + ':' + stableJson(v[k]); }).join(',') + '}';
+  }
+
+  // Exact PUBLIC_TARGET tuple equality: every field, no partial matches.
+  function sameTarget(a, b) {
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) return false;
+    if (typeof a.thread !== 'string' || !a.thread) return false;
+    return stableJson(a) === stableJson(b);
+  }
+
+  function validChat(c) {
+    return !!c && typeof c === 'object' && typeof c.selection_id === 'string' && !!c.selection_id &&
+      !!c.target && typeof c.target === 'object' && typeof c.target.thread === 'string' && !!c.target.thread;
+  }
+
+  function indexOfTarget(chats, target) {
+    if (!target) return -1;
+    for (var i = 0; i < (chats || []).length; i++) if (sameTarget(chats[i].target, target)) return i;
+    return -1;
+  }
+
+  function defaultIndex(chats) {
+    for (var i = 0; i < (chats || []).length; i++) if (chats[i].is_default === true) return i;
+    return -1;
+  }
+
+  function chatLabel(c) {
+    var t = (c && c.target) || {};
+    var label = (t.window_name ? String(t.window_name) : 'Codex window') + (t.session ? ' (' + String(t.session) + ')' : '');
+    if (c && c.is_default === true) label = 'Current chat: ' + label;
+    if (c && c.composer && c.composer !== 'ready') label += ' - Codex ' + String(c.composer);
+    return label;
+  }
+
+  function sessionRemaining(s, nowMs) { return s && s.nonce ? s.sessionDeadline - nowMs : 0; }
+
+  function normalizeLimits(limits) {
+    var out = {};
+    Object.keys(DEFAULT_LIMITS).forEach(function (k) {
+      var v = limits && limits[k];
+      out[k] = (typeof v === 'number' && isFinite(v) && v > 0) ? Math.min(v, DEFAULT_LIMITS[k]) : DEFAULT_LIMITS[k];
+    });
+    return out;
+  }
+
+  function wholeNumber(v) { return (typeof v === 'number' && isFinite(v) && v >= 0) ? Math.floor(v) : null; }
+
+  function normalizeRetention(r, days) {
+    r = (r && typeof r === 'object') ? r : {};
+    return {
+      days: wholeNumber(r.days) || days, managed: wholeNumber(r.managed), held: wholeNumber(r.held),
+      last_run: typeof r.last_run === 'string' ? r.last_run : null,
+      last_error: typeof r.last_error === 'string' && r.last_error ? r.last_error : null
+    };
+  }
+
+  function formatBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '?';
+    if (n < 1024) return n + ' B';
+    if (n < MIB) return (n / 1024).toFixed(1) + ' KiB';
+    return (n / MIB).toFixed(1) + ' MiB';
+  }
+
+  function itemSize(it) { return (it && typeof it.size === 'number') ? it.size : 0; }
+
+  // Validates the whole incoming batch against the existing queue; nothing is
+  // added unless every file passes.
+  function validateBatch(existing, incoming, limits) {
+    limits = normalizeLimits(limits);
+    existing = existing || [];
+    incoming = incoming || [];
+    var count = existing.length + incoming.length;
+    if (count > limits.max_files) {
+      return { ok: false, code: 'too_many_files', message: 'Nothing was added: at most ' + limits.max_files + ' screenshots per upload (' + count + ' selected).' };
+    }
+    var total = existing.reduce(function (sum, it) { return sum + itemSize(it); }, 0);
+    var problems = [];
+    incoming.forEach(function (f) {
+      var name = fileName(f) || 'unnamed file';
+      if (!allowedFile(f)) {
+        problems.push(isHeic(f)
+          ? name + ': HEIC/HEIF is not supported. Export or share it as JPEG or PNG instead.'
+          : name + ': unsupported type. Use PNG, JPEG, GIF or WebP.');
+      } else if (!(typeof f.size === 'number' && f.size > 0)) {
+        problems.push(name + ': file is empty.');
+      } else if (f.size > limits.max_image) {
+        problems.push(name + ': ' + formatBytes(f.size) + ' exceeds the ' + formatBytes(limits.max_image) + ' per-image limit.');
+      } else {
+        total += f.size;
+      }
+    });
+    if (problems.length) return { ok: false, code: 'invalid_files', message: 'Nothing was added. ' + problems.join(' ') };
+    if (total > limits.max_batch) {
+      return { ok: false, code: 'batch_too_large', message: 'Nothing was added: total ' + formatBytes(total) + ' exceeds the ' + formatBytes(limits.max_batch) + ' per-upload limit.' };
+    }
+    return { ok: true, total: total };
+  }
+
+  function createState() {
+    return {
+      queue: [], operationId: null, nonce: null, confirmed: false, armed: false, busy: false,
+      receiptInspected: false, target: null, targetId: null, composer: null, isDefault: false,
+      lastOperation: null, error: null, message: '', recent: [], needsAck: false,
+      inspected: null, inspectedIds: [], working: false, connected: false, limits: normalizeLimits(null),
+      protocol: null, ttlSeconds: null, sessionDeadline: 0, renewMargin: RENEW_MARGIN_MS, retentionDays: RETENTION_DAYS,
+      chats: [], chatsTruncated: false, selectedIndex: -1, confirmedTarget: null,
+      stage: 'idle', inflight: [], unresolved: 0, unresolvedCapacity: null,
+      retention: normalizeRetention(null, RETENTION_DAYS), reloadRequired: false, queueRev: 0, now: 0
+    };
+  }
+
+  function hasPendingUncertainty(s) { return !!(s.operationId || s.needsAck); }
+
+  function confirm(s) {
+    s.confirmed = true;
+    // Confirmation (including automatic renewal) never authorizes an old
+    // queued batch. The user can attach it explicitly after checking it.
+    s.armed = !hasPendingUncertainty(s) && !s.queue.length;
+    return s;
+  }
+
+  function begin(s, id) {
+    s.operationId = id;
+    s.busy = true;
+    s.armed = false;
+    s.receiptInspected = false;
+    s.inspected = null;
+    return s;
+  }
+
+  function fail(s) {
+    s.busy = false;
+    s.armed = false;
+    return s;
+  }
+
+  function mayAutoUpload(s) { return !!(s.confirmed && s.armed && !s.busy); }
+
+  function allowRetry(s, receiptInspected, draftAcknowledged) {
+    if (!(receiptInspected === true && draftAcknowledged === true && s.confirmed)) return false;
+    s.operationId = null;
+    s.busy = false;
+    s.armed = true;
+    s.needsAck = false;
+    s.receiptInspected = false;
+    s.inspected = null;
+    s.inspectedIds = [];
+    s.inflight = [];
+    return true;
+  }
+
+  // ---- Attach-state descriptions (unknown states are never success) ------
+
+  function describeFileAttach(state) {
+    switch (state) {
+      case 'attached-verified': return { cls: 'ok', text: 'Attached to draft (verified)' };
+      case 'saved': return { cls: 'warn', text: 'Saved only - not attached' };
+      case 'not-attempted': return { cls: 'warn', text: 'Saved, attach not attempted - not attached' };
+      case 'pasting': return { cls: 'warn', text: 'Paste in progress, not verified - check the draft' };
+      case 'pasted-unverified': return { cls: 'warn', text: 'Pasted but not verified - check the draft' };
+      case 'paste-uncertain': return { cls: 'bad', text: 'Paste uncertain - check the draft' };
+      default: return { cls: 'bad', text: 'Unknown state "' + String(state) + '" - treat as not attached' };
+    }
+  }
+
+  function describeTopAttach(state) {
+    switch (state) {
+      case 'verified': return { cls: 'ok', text: 'Attachment verified' };
+      case 'blocked': return { cls: 'bad', text: 'Attachment blocked - not attached' };
+      case 'unverified': return { cls: 'warn', text: 'Attachment not verified - check the draft' };
+      case 'skipped': return { cls: 'warn', text: 'Attachment skipped - saved only' };
+      default: return { cls: 'bad', text: 'Unknown attach state "' + String(state) + '" - treat as not attached' };
+    }
+  }
+
+  function errorOf(resp, fallbackCode, fallbackMessage) {
+    var e = resp && resp.error;
+    return {
+      code: (e && typeof e.code === 'string') ? e.code : fallbackCode,
+      message: (e && typeof e.message === 'string') ? e.message : fallbackMessage
+    };
+  }
+
+  function isSessionError(resp) {
+    if (!resp || resp.ok === true) return false;
+    var code = resp.error && resp.error.code;
+    return resp.http_status === 403 || code === 'session' || code === 'session_expired';
+  }
+
+  function missingText(id) {
+    return 'No receipt is available for operation ' + id + '; its outcome cannot be confirmed here. Check the actual Codex draft before uploading again.';
+  }
+
+  function expiredText(id) {
+    return 'Operation ' + id + ' is no longer available; its ticket or receipt may have expired. Its attachment outcome cannot be confirmed here. Check the actual Codex draft before preparing a new upload.';
+  }
+
+  function operationSummary(op) {
+    if (!op) return 'No operation.';
+    var r = op.result || {};
+    if (op.state === 'uncertain') return 'Outcome uncertain (' + errorOf(r, 'outcome_uncertain', '').code + ').';
+    if (r.ok !== true) {
+      var e = errorOf(r, 'receiver_error', 'Receiver reported an error.');
+      return 'Receiver error ' + e.code + ': ' + e.message;
+    }
+    var a = r.attach || {};
+    return describeTopAttach(a.state).text + (a.message ? ': ' + a.message : '.');
+  }
+
+  // ---- Default I/O --------------------------------------------------------
+
+  function toHex(buf) {
+    return Array.prototype.map.call(new Uint8Array(buf), function (x) { return (x + 0x100).toString(16).slice(1); }).join('');
+  }
+
+  function toBase64(bytes) {
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += 0x8000) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  async function prepareFiles(files) {
+    var out = [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var buf = await f.arrayBuffer();
+      if (buf.byteLength !== f.size) throw new Error((f.name || 'A screenshot') + ' changed while it was being read.');
+      var digest = await globalThis.crypto.subtle.digest('SHA-256', buf);
+      out.push({ name: f.name || ('screenshot-' + (i + 1)), size: buf.byteLength, sha256: toHex(digest), data: toBase64(new Uint8Array(buf)) });
+    }
+    return out;
+  }
+
+  // Same-origin fetch. The browser adds Origin itself; referrer policy must
+  // not be no-referrer or the browser would send "Origin: null".
+  async function fetchApi(method, path, body, nonce) {
+    var headers = { 'Accept': 'application/json' };
+    if (nonce) headers['X-Codex-Drop-Nonce'] = nonce;
+    var init = {
+      method: method, headers: headers, credentials: 'omit', cache: 'no-store',
+      mode: 'same-origin', redirect: 'error', referrerPolicy: 'same-origin'
+    };
+    if (method !== 'GET') {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body || {});
+    }
+    // Aborting only stops waiting; the server outcome stays unknown.
+    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = null;
+    if (ctrl) {
+      init.signal = ctrl.signal;
+      timer = setTimeout(function () { ctrl.abort(); }, path === '/api/upload' ? 300000 : 30000);
+    }
+    try {
+      var resp = await fetch(path, init);
+      var text = await resp.text();
+      var data = null;
+      try { data = JSON.parse(text); } catch (e) { data = null; }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        data = { ok: false, error: { code: 'bad_response', message: 'Server returned HTTP ' + resp.status + ' without a JSON reply.' } };
+      }
+      if (!resp.ok && data.ok === true) {
+        data = { ok: false, error: { code: 'http_' + resp.status, message: 'Server returned HTTP ' + resp.status + '.' } };
+      }
+      data.http_status = resp.status;
+      return data;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function defaultPreview(file) {
+    if (globalThis.CODEX_DROP_TEST) return null;
+    try { return (typeof URL !== 'undefined' && URL.createObjectURL) ? URL.createObjectURL(file) : null; } catch (e) { return null; }
+  }
+
+  function defaultRevoke(url) {
+    if (!url) return;
+    try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+  }
+
+  // ---- Controller ---------------------------------------------------------
+
+  // Options: api, prepare, render, preview, revoke, now (ms clock) and timers
+  // ({setTimeout, clearTimeout}; without it no timer is ever scheduled).
+  // Operation IDs are issued by the server, so a newId option is ignored.
+  function createController(opts) {
+    opts = opts || {};
+    var api = opts.api || fetchApi;
+    var prepare = opts.prepare || prepareFiles;
+    var render = opts.render || function () {};
+    var preview = opts.preview || defaultPreview;
+    var revoke = opts.revoke || defaultRevoke;
+    var now = typeof opts.now === 'function' ? opts.now : function () { return Date.now(); };
+    var timers = (opts.timers && typeof opts.timers.setTimeout === 'function' && typeof opts.timers.clearTimeout === 'function') ? opts.timers : null;
+    var s = createState();
+    var tickHandle = null;
+    var disposed = false;
+    var lastResume = -Infinity;
+
+    function scheduleTick() {
+      if (!timers) return;
+      if (tickHandle !== null) { timers.clearTimeout(tickHandle); tickHandle = null; }
+      if (disposed || !s.nonce) return;
+      var left = s.sessionDeadline - now();
+      if (left <= 0) return; // One final render shows expiry; renewal waits for the user or a resume.
+      tickHandle = timers.setTimeout(function () { tickHandle = null; update(); }, Math.max(1000, Math.min(TICK_MS, left)));
+    }
+    function update() {
+      s.now = now();
+      try { render(s); } catch (e) { if (typeof console !== 'undefined') console.error(e); }
+      scheduleTick();
+    }
+    function setError(code, message) { s.error = { code: code, message: message }; }
+    function isOk(resp) { return !!resp && resp.ok === true; }
+    function errText(err) { return (err && err.message) || String(err); }
+    function revokeAll() { s.queue.forEach(function (it) { revoke(it.url); }); }
+    function remember(op) {
+      if (!op || !op.operation_id) return;
+      s.recent = [op].concat((s.recent || []).filter(function (o) { return !o || o.operation_id !== op.operation_id; }));
+    }
+    function incidents() {
+      var seen = {};
+      return (s.recent || []).concat(s.lastOperation ? [s.lastOperation] : []).filter(function (op) {
+        if (!isIncident(op) || typeof op.operation_id !== 'string' || seen[op.operation_id]) return false;
+        seen[op.operation_id] = true;
+        return true;
+      });
+    }
+    function markInspected() {
+      s.receiptInspected = true;
+      s.inspectedIds = incidents().map(function (op) { return op.operation_id; });
+    }
+    function sessionExpired() { return !s.nonce || now() >= s.sessionDeadline - s.renewMargin; }
+    function unconfirm() { s.confirmed = false; s.armed = false; }
+    function dropTarget(message) {
+      unconfirm();
+      s.confirmedTarget = null;
+      s.target = null;
+      s.targetId = null;
+      s.composer = null;
+      s.isDefault = false;
+      s.selectedIndex = -1;
+      if (message) s.message = message;
+    }
+    function endBusy() {
+      s.busy = false;
+      s.armed = false;
+      s.stage = 'idle';
+    }
+    function clearTransientError() {
+      if (s.error && TRANSIENT_ERRORS[s.error.code]) s.error = null;
+    }
+
+    function applyReceipts(rec) {
+      s.recent = rec.operations;
+      s.unresolved = wholeNumber(rec.unresolved) || 0;
+      s.unresolvedCapacity = wholeNumber(rec.unresolved_capacity);
+      s.retention = normalizeRetention(rec.retention, s.retentionDays);
+      if (needsAcknowledgement(rec.operations, s.unresolved)) {
+        s.needsAck = true;
+        s.armed = false;
+        var unseen = incidents().some(function (op) { return s.inspectedIds.indexOf(op.operation_id) === -1; });
+        if (unseen || !incidents().length) s.receiptInspected = false;
+      } else if (!s.operationId) {
+        // Server truth: nothing unresolved (e.g. checked from another device).
+        s.needsAck = false;
+        s.receiptInspected = false;
+        s.inspectedIds = [];
+      }
+    }
+
+    async function readReceipts(quiet) {
+      var rec = await api('GET', '/api/receipts', null, s.nonce);
+      if (!isOk(rec) || !Array.isArray(rec.operations)) {
+        if (!quiet) {
+          var e = errorOf(rec, 'receipts_failed', 'Could not read recent receipts.');
+          setError(e.code, 'Uploads are blocked until recent receipts can be read: ' + e.message);
+          s.connected = false;
+          unconfirm();
+        }
+        return false;
+      }
+      applyReceipts(rec);
+      return true;
+    }
+
+    async function readChats(quiet) {
+      var r = await api('GET', '/api/chats', null, s.nonce);
+      if (!isOk(r) || !Array.isArray(r.chats)) {
+        if (!quiet) {
+          var e = errorOf(r, 'chats_failed', 'Could not list Codex chats.');
+          setError(e.code, 'Could not list Codex chats: ' + e.message);
+        }
+        return false;
+      }
+      s.chats = r.chats.filter(validChat).slice(0, MAX_CHATS);
+      s.chatsTruncated = r.truncated === true || r.chats.length > MAX_CHATS;
+      s.selectedIndex = indexOfTarget(s.chats, s.target);
+      return true;
+    }
+
+    // A confirmed target that disappeared or changed in any field must be
+    // chosen and confirmed again explicitly.
+    function reconcileChats() {
+      if (s.target && s.selectedIndex < 0) {
+        dropTarget('The chat you were using changed or closed. Choose a chat and confirm it again.');
+      }
+    }
+
+    async function chooseIndex(idx) {
+      var entry = s.chats[idx];
+      if (!entry) return false;
+      dropTarget(null);
+      var resp = await api('POST', '/api/target', { selection_id: entry.selection_id }, s.nonce);
+      if (!isOk(resp)) {
+        var e = errorOf(resp, 'target_failed', 'Could not select that chat.');
+        setError(e.code, 'Could not select the chat: ' + e.message + ' Refresh the chat list and choose again.');
+        return false;
+      }
+      if (typeof resp.target_id !== 'string' || !resp.target_id || !sameTarget(resp.target, entry.target)) {
+        setError('target_changed', 'That chat changed while loading. Refresh the chat list and choose again.');
+        return false;
+      }
+      s.targetId = resp.target_id;
+      s.target = resp.target;
+      s.composer = resp.composer === undefined ? (entry.composer === undefined ? null : entry.composer) : resp.composer;
+      s.isDefault = resp.is_default === true;
+      s.selectedIndex = idx;
+      return true;
+    }
+
+    async function doConfirm() {
+      var resp = await api('POST', '/api/confirm', { target_id: s.targetId }, s.nonce);
+      if (isOk(resp) && resp.confirmed === true && (!resp.target || sameTarget(resp.target, s.target))) {
+        confirm(s);
+        s.confirmedTarget = s.target;
+        if (s.stage === 'attached') s.stage = 'idle';
+        return true;
+      }
+      unconfirm();
+      var e = errorOf(resp, 'confirm_failed', 'The chat could not be confirmed.');
+      if (isOk(resp)) e = { code: 'target_changed', message: 'The chat changed while it was being confirmed.' };
+      setError(e.code, 'Chat not confirmed: ' + e.message + ' Refresh the chat list and check it again.');
+      return false;
+    }
+
+    // Starts a fresh session. A previous user confirmation is renewed only
+    // when the new catalog has an entry with the exact same PUBLIC_TARGET.
+    async function renewSession(prefer) {
+      var prior = s.confirmedTarget;
+      s.nonce = null;
+      s.connected = false;
+      s.sessionDeadline = 0;
+      unconfirm();
+      s.targetId = null;
+      var sess = await api('POST', '/api/session', {}, null);
+      if (!isOk(sess) || typeof sess.nonce !== 'string' || !sess.nonce) {
+        var e1 = errorOf(sess, 'session_failed', 'Could not start a session.');
+        setError(e1.code, 'Could not connect: ' + e1.message);
+        return false;
+      }
+      if (sess.protocol !== PROTOCOL) {
+        s.reloadRequired = true;
+        setError('protocol_reload', RELOAD_MESSAGE);
+        return false;
+      }
+      s.nonce = sess.nonce;
+      s.protocol = sess.protocol;
+      var ttl = (typeof sess.ttl_seconds === 'number' && isFinite(sess.ttl_seconds) && sess.ttl_seconds > 0) ? sess.ttl_seconds : 0;
+      s.ttlSeconds = ttl || null;
+      s.sessionDeadline = now() + ttl * 1000; // No TTL: renew before every use.
+      s.renewMargin = Math.min(RENEW_MARGIN_MS, ttl * 250);
+      s.limits = normalizeLimits(sess.limits);
+      s.retentionDays = wholeNumber(sess.retention_days) || RETENTION_DAYS;
+
+      if (!(await readReceipts(false))) return false;
+      if (!(await readChats(false))) return false;
+      s.connected = true;
+      var idx = prior ? indexOfTarget(s.chats, prior) : -1;
+      var priorMatched = idx >= 0;
+      if (idx < 0 && prefer) idx = indexOfTarget(s.chats, prefer);
+      if (idx < 0) idx = defaultIndex(s.chats);
+      if (idx < 0) {
+        dropTarget(s.chats.length ? 'Choose the chat to attach screenshots to.' : 'No Codex chats were found on the home computer.');
+        return true;
+      }
+      if (!(await chooseIndex(idx))) return true;
+      if (priorMatched && sameTarget(s.target, prior)) {
+        if (await doConfirm()) s.message = 'Session renewed; the same chat is still in use.';
+      } else if (prior) {
+        s.message = 'The chat you confirmed earlier changed or closed. Check the chat below and confirm it.';
+      }
+      return true;
+    }
+
+    async function ensureSession(prefer) {
+      if (!sessionExpired()) return true;
+      return renewSession(prefer || s.target);
+    }
+
+    // Renews once on a session refusal. Never used for /api/upload.
+    async function call(method, path, body) {
+      var resp = await api(method, path, body, s.nonce);
+      if (isSessionError(resp)) {
+        if (!(await renewSession(s.target))) return resp;
+        resp = await api(method, path, body, s.nonce);
+      }
+      return resp;
+    }
+
+    async function connect() {
+      if (s.busy || s.working || s.reloadRequired || disposed) return false;
+      s.working = true;
+      s.error = null;
+      s.message = '';
+      update();
+      try {
+        return (await renewSession(s.target)) && s.connected;
+      } catch (err) {
+        setError('network', 'Could not reach Codex Drop: ' + errText(err) + '. Use Connect when ready.');
+        return false;
+      } finally {
+        s.working = false;
+        if (!s.connected) fail(s);
+        update();
+      }
+    }
+
+    // Read-only readiness refresh for focus/pageshow/visibility/online. It
+    // never prepares, reserves or uploads anything, even with a queue.
+    async function resume() {
+      if (disposed || s.busy || s.working || s.reloadRequired) return false;
+      var t = now();
+      if (t - lastResume < RESUME_MIN_MS) return false;
+      lastResume = t;
+      s.working = true;
+      update();
+      try {
+        if (!s.connected || sessionExpired()) {
+          var ok = (await renewSession(s.target)) && s.connected;
+          if (ok) clearTransientError();
+          return ok;
+        }
+        if (!(await readReceipts(true))) return false;
+        if (await readChats(true)) reconcileChats();
+        if (s.operationId && !s.receiptInspected) await lookupReceipt(s.operationId);
+        clearTransientError();
+        return true;
+      } catch (err) {
+        setError('network', 'Could not reach Codex Drop: ' + errText(err) + '. Nothing was sent.');
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    async function refreshTarget() {
+      if (s.busy || s.working || !s.nonce) return false;
+      s.working = true;
+      s.error = null;
+      update();
+      try {
+        if (!(await ensureSession())) return false;
+        if (!(await readChats(false))) return false;
+        reconcileChats();
+        if (!s.target) {
+          var idx = defaultIndex(s.chats);
+          if (idx >= 0) return chooseIndex(idx);
+          if (s.chats.length) s.message = 'Choose the chat to attach screenshots to.';
+        }
+        return !!s.target;
+      } catch (err) {
+        setError('network', 'Could not reach Codex Drop: ' + errText(err));
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    async function selectChat(index) {
+      if (s.busy || s.working || !s.nonce) return false;
+      var entry = s.chats[index];
+      if (!entry) return false;
+      var wanted = entry.target;
+      s.working = true;
+      s.error = null;
+      s.message = '';
+      s.confirmedTarget = null; // A new choice always needs a new explicit confirmation.
+      update();
+      try {
+        if (!(await ensureSession(wanted))) return false;
+        var idx = indexOfTarget(s.chats, wanted);
+        if (idx < 0) {
+          dropTarget(null);
+          setError('target_changed', 'That chat changed or closed. Choose a chat again.');
+          return false;
+        }
+        if (s.target && sameTarget(s.target, wanted) && s.targetId) { unconfirm(); return true; }
+        return await chooseIndex(idx);
+      } catch (err) {
+        setError('network', 'Could not reach Codex Drop: ' + errText(err));
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    async function confirmChat() {
+      if (s.busy || s.working || !s.nonce || !s.targetId) return false;
+      var wanted = s.target;
+      s.working = true;
+      s.error = null;
+      update();
+      try {
+        if (!(await ensureSession(wanted))) return false;
+        if (!sameTarget(s.target, wanted) || !s.targetId) {
+          if (!s.error) setError('target_changed', 'The chat changed while the session renewed. Check it again before using it.');
+          return false;
+        }
+        if (s.confirmed) return true;
+        if (!(await doConfirm())) return false;
+        s.message = s.armed
+          ? 'Using this chat. Dropped, pasted or chosen screenshots attach automatically.'
+          : 'Using this chat. ' + RECOVERY_HINT;
+        return true;
+      } catch (err) {
+        unconfirm();
+        setError('network', 'Could not confirm the chat: ' + errText(err));
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    async function addFiles(files) {
+      if (s.busy) {
+        setError('busy', 'An upload is in progress. Wait for it to finish before adding screenshots.');
+        update();
+        return false;
+      }
+      var list = Array.prototype.slice.call(files || []);
+      if (!list.length) return false;
+      var check = validateBatch(s.queue, list, s.limits);
+      if (!check.ok) {
+        setError(check.code, check.message);
+        update();
+        return false;
+      }
+      list.forEach(function (f) {
+        s.queue.push({ file: f, name: fileName(f) || 'screenshot', size: f.size, type: fileType(f), url: preview(f) });
+      });
+      s.queueRev++;
+      s.error = null;
+      if (mayAutoUpload(s) && !s.working && s.connected && !hasPendingUncertainty(s)) return send();
+      if (s.confirmed && s.armed && s.working) s.message = 'Added. Tap "Attach selected" to upload.';
+      update();
+      return true;
+    }
+
+    function succeed(items) {
+      items.forEach(function (it) { revoke(it.url); });
+      s.queue = s.queue.filter(function (it) { return items.indexOf(it) === -1; });
+      s.queueRev++;
+      s.operationId = null;
+      s.inflight = [];
+      s.busy = false;
+      s.armed = s.confirmed;
+      s.stage = 'attached';
+      s.receiptInspected = false;
+      s.inspected = null;
+      s.error = null;
+      s.message = SUCCESS_MESSAGE;
+    }
+
+    // Read-only lookup of one operation. A verified receipt settles it; any
+    // other answer keeps it open for the user to check the draft.
+    async function lookupReceipt(id) {
+      var r = await call('GET', '/api/receipt/' + encodeURIComponent(id), null);
+      if (isOk(r) && r.operation && r.operation.operation_id === id) {
+        var op = r.operation;
+        if (r.resolution && typeof r.resolution === 'object') op.resolution = r.resolution;
+        s.lastOperation = op;
+        remember(op);
+        if (verified(op) && s.operationId === id) {
+          succeed(s.inflight || []);
+          return 'verified';
+        }
+        s.inspected = { kind: 'operation', operation: op };
+        markInspected();
+        return 'operation';
+      }
+      if (r && r.ok === false && errorOf(r, '', '').code === 'receipt_missing') {
+        s.inspected = { kind: 'missing', operation_id: id };
+        markInspected();
+        return 'missing';
+      }
+      var e = errorOf(r, 'receipt_failed', 'Could not read the receipt.');
+      setError(e.code, 'Could not read the receipt: ' + e.message);
+      return 'error';
+    }
+
+    async function send() {
+      if (s.busy || s.working) return false;
+      if (s.reloadRequired) {
+        setError('protocol_reload', RELOAD_MESSAGE);
+        update();
+        return false;
+      }
+      if (!s.nonce || !s.connected || !s.confirmed || !s.targetId) {
+        setError('not_confirmed', 'Choose "Use this chat" before attaching.');
+        update();
+        return false;
+      }
+      if (hasPendingUncertainty(s)) {
+        s.armed = false;
+        setError('needs_reconcile', RECOVERY_HINT);
+        update();
+        return false;
+      }
+      if (!s.queue.length) {
+        setError('empty', 'Choose or drop screenshots first.');
+        update();
+        return false;
+      }
+      var check = validateBatch([], s.queue.map(function (it) { return it.file; }), s.limits);
+      if (!check.ok) {
+        setError(check.code, check.message.replace('Nothing was added', 'Nothing was sent'));
+        update();
+        return false;
+      }
+      var items = s.queue.slice();
+      var wanted = s.target;
+      s.busy = true;
+      s.armed = false;
+      s.stage = 'preparing';
+      s.inflight = items;
+      s.error = null;
+      s.message = '';
+      s.inspected = null;
+      update();
+
+      // 1. Read files locally. A failure here has no operation ID at all.
+      var images;
+      try {
+        images = await prepare(items.map(function (it) { return it.file; }));
+        if (!Array.isArray(images) || images.length !== items.length) throw new Error('Screenshot preparation was incomplete.');
+      } catch (perr) {
+        endBusy();
+        s.inflight = [];
+        setError('prepare_failed', 'Could not read the screenshots on this device, so nothing was sent: ' + errText(perr) + ' ' + STILL_QUEUED + ' Tap "Attach selected" to try again.');
+        update();
+        return false;
+      }
+
+      // 2. Renew if needed and get a fresh server-issued operation ID.
+      var id = null;
+      try {
+        if (!(await ensureSession(wanted)) || !s.confirmed || !sameTarget(s.target, wanted)) {
+          endBusy();
+          s.inflight = [];
+          if (!s.error) setError('needs_confirm', 'The session was renewed and the chat needs your confirmation again. Nothing was sent. ' + STILL_QUEUED);
+          update();
+          return false;
+        }
+        s.stage = 'reserving';
+        update();
+        var ticket = await api('POST', '/api/operations', { protocol: PROTOCOL }, s.nonce);
+        if (isSessionError(ticket) && (await renewSession(wanted)) && s.confirmed && sameTarget(s.target, wanted)) {
+          ticket = await api('POST', '/api/operations', { protocol: PROTOCOL }, s.nonce);
+        }
+        id = isOk(ticket) ? ticket.operation_id : null;
+        if (typeof id !== 'string' || !UUID_RE.test(id)) {
+          endBusy();
+          s.inflight = [];
+          var te = errorOf(ticket, 'operation_failed', 'The home computer did not issue an upload ticket.');
+          if (te.code === 'protocol_reload') { s.reloadRequired = true; setError(te.code, RELOAD_MESSAGE); }
+          else if (te.code === 'journal_full') setError(te.code, 'Too many uploads are waiting to be checked, so nothing was sent. Open "Storage and recent receipts", check them, then try again. ' + STILL_QUEUED);
+          else setError(te.code, 'Nothing was sent: ' + te.message + ' ' + STILL_QUEUED);
+          update();
+          return false;
+        }
+      } catch (err) {
+        endBusy();
+        s.inflight = [];
+        setError('network', 'Could not reach the home computer before uploading, so nothing was sent. ' + STILL_QUEUED);
+        update();
+        return false;
+      }
+
+      // 3. Dispatch exactly once with that ID. From here the ID stays open
+      // until a receipt or a definite pre-dispatch refusal settles it.
+      begin(s, id);
+      s.stage = 'transferring';
+      update();
+      var resp;
+      try {
+        resp = await api('POST', '/api/upload', { protocol: PROTOCOL, operation_id: id, images: images }, s.nonce);
+      } catch (err) {
+        images = null;
+        s.stage = 'checking';
+        setError('network_uncertain', 'Connection lost during upload; the outcome is unknown. Checking the receipt; nothing will be resent.');
+        update();
+        try {
+          if ((await lookupReceipt(id)) === 'verified') { update(); return true; }
+        } catch (lerr) { /* Still unknown; resume or "Check upload status" looks again. */ }
+        endBusy();
+        setError('network_uncertain', 'Connection problem during upload; the outcome is unknown and nothing will be retried automatically. ' + RECOVERY_HINT);
+        update();
+        return false;
+      }
+      images = null;
+      try {
+        var op = isOk(resp) ? resp.operation : null;
+        if (op && op.operation_id === id) {
+          s.lastOperation = op;
+          remember(op);
+          if (verified(op)) { succeed(items); return true; }
+          endBusy();
+          s.inspected = { kind: 'operation', operation: op };
+          markInspected();
+          setError(op.state === 'uncertain' ? 'outcome_uncertain' : 'not_verified',
+            'Not confirmed as attached. ' + operationSummary(op) + ' ' + RECOVERY_HINT);
+          return false;
+        }
+        var e = errorOf(resp, 'upload_failed', 'Upload failed.');
+        var code = isSessionError(resp) ? 'session' : e.code;
+        endBusy();
+        s.working = true; // No new action until server truth below is read.
+        if (code === 'operation_unknown' || resp.http_status === 410) {
+          // A compacted operation may already have attached. Never infer
+          // that an unknown ID is safe to upload again.
+          s.inspected = { kind: 'expired', operation_id: id };
+          markInspected();
+          setError('operation_unknown', expiredText(id) + ' ' + STILL_QUEUED);
+        } else if (DEFINITE_REFUSALS[code]) {
+          s.operationId = null;
+          s.inflight = [];
+          if (code === 'protocol_reload') { s.reloadRequired = true; setError(code, RELOAD_MESSAGE); }
+          else if (code === 'session') { s.sessionDeadline = 0; setError(code, 'The session expired before the upload started, so nothing was sent. ' + STILL_QUEUED + ' Tap "Attach selected" to try again.'); }
+          else if (code === 'busy') setError(code, 'The home computer is handling an upload or screenshot cleanup, so nothing was sent. ' + STILL_QUEUED + ' Tap "Attach selected" again in a moment.');
+          else { dropTarget(null); setError(code, 'The chat changed before the upload started, so nothing was sent. ' + STILL_QUEUED + ' Check the chat and confirm it again.'); }
+        } else {
+          setError(code, 'Upload not confirmed: ' + e.message + ' ' + RECOVERY_HINT);
+          update();
+          try { await lookupReceipt(id); } catch (lerr) { /* Stays uncertain. */ }
+        }
+        // Server truth decides whether anything is still unresolved.
+        try { await readReceipts(true); } catch (rerr) { /* ignore */ }
+        return false;
+      } finally {
+        if (s.busy) endBusy();
+        s.working = false;
+        update();
+      }
+    }
+
+    async function inspect() {
+      if (s.busy || s.working) return false;
+      s.receiptInspected = false;
+      s.inspectedIds = [];
+      if (!s.nonce) {
+        setError('not_connected', 'Connect first, then check upload status.');
+        update();
+        return false;
+      }
+      s.working = true;
+      s.error = null;
+      update();
+      try {
+        if (!(await ensureSession())) return false;
+        if (!(await readReceipts(false))) return false;
+        s.connected = true;
+        if (s.operationId) return (await lookupReceipt(s.operationId)) !== 'error';
+        s.inspected = { kind: 'list', count: incidents().length };
+        markInspected();
+        return true;
+      } catch (err) {
+        setError('network', 'Could not read receipts: ' + errText(err));
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    function markResolved(id, resolution) {
+      (s.recent || []).concat(s.lastOperation ? [s.lastOperation] : []).forEach(function (op) {
+        if (op && op.operation_id === id) op.resolution = resolution;
+      });
+    }
+
+    // Durable acknowledgement: only after an explicit checkbox and tap, and
+    // only for the incidents the user inspected. Uploads nothing.
+    async function retry(ack) {
+      if (s.busy || s.working) return false;
+      if (!(s.receiptInspected === true && ack === true && s.confirmed && s.nonce)) {
+        setError('retry_blocked', !s.confirmed
+          ? 'Use this chat first, then mark the upload as checked.'
+          : 'Check upload status and confirm you checked the Codex draft first.');
+        update();
+        return false;
+      }
+      var open = incidents();
+      var targets = open.filter(function (op) { return s.inspectedIds.indexOf(op.operation_id) !== -1; });
+      if (targets.length !== open.length) {
+        s.receiptInspected = false;
+        setError('reinspect', 'More uploads need checking. Check upload status again first.');
+        update();
+        return false;
+      }
+      s.working = true;
+      s.error = null;
+      update();
+      try {
+        for (var i = 0; i < targets.length; i++) {
+          var id = targets[i].operation_id;
+          var r = await call('POST', '/api/resolve', { operation_id: id });
+          if (!isOk(r) || !r.resolution || r.resolution.state !== 'acknowledged') {
+            var e = errorOf(r, 'resolve_failed', 'The home computer did not record the check.');
+            setError(e.code, 'Could not mark operation ' + id + ' as checked: ' + e.message);
+            return false;
+          }
+          markResolved(id, r.resolution);
+        }
+        if (!allowRetry(s, true, true)) {
+          setError('retry_blocked', 'Use this chat again, then mark the upload as checked.');
+          return false;
+        }
+        // Acknowledging an incident does not authorize resending its files
+        // on the next drop. Existing queued files need an explicit Attach.
+        if (s.queue.length) s.armed = false;
+        await readReceipts(true);
+        if (hasPendingUncertainty(s)) {
+          s.armed = false;
+          s.message = 'More uploads need checking before a new upload.';
+          return false;
+        }
+        s.stage = 'idle';
+        s.message = s.queue.length ? 'Marked as checked. Tap "Attach selected" to upload the queued screenshots.' : 'Marked as checked. New screenshots attach automatically.';
+        return true;
+      } catch (err) {
+        setError('network', 'Could not mark the upload as checked: ' + errText(err));
+        return false;
+      } finally {
+        s.working = false;
+        update();
+      }
+    }
+
+    function remove(index) {
+      if (s.busy) return false;
+      if (typeof index !== 'number' || index < 0 || index >= s.queue.length) return false;
+      var it = s.queue.splice(index, 1)[0];
+      revoke(it && it.url);
+      s.queueRev++;
+      update();
+      return true;
+    }
+
+    function clear() {
+      if (s.busy) return false;
+      revokeAll();
+      s.queue = [];
+      s.queueRev++;
+      update();
+      return true;
+    }
+
+    function dispose() {
+      disposed = true;
+      if (timers && tickHandle !== null) timers.clearTimeout(tickHandle);
+      tickHandle = null;
+    }
+
+    return {
+      state: s, connect: connect, confirmChat: confirmChat, refreshTarget: refreshTarget, selectChat: selectChat,
+      addFiles: addFiles, send: send, inspect: inspect, retry: retry, resolve: retry, resume: resume,
+      remove: remove, clear: clear, dispose: dispose
+    };
+  }
+
+  globalThis.CodexDropTest = {
+    allowedFile: allowedFile, verified: verified, createState: createState, confirm: confirm,
+    begin: begin, fail: fail, mayAutoUpload: mayAutoUpload, allowRetry: allowRetry,
+    createController: createController, validateBatch: validateBatch,
+    describeFileAttach: describeFileAttach, describeTopAttach: describeTopAttach,
+    sameTarget: sameTarget, isIncident: isIncident, acknowledged: acknowledged,
+    needsAcknowledgement: needsAcknowledgement, sessionRemaining: sessionRemaining,
+    chatLabel: chatLabel, missingText: missingText, expiredText: expiredText, PROTOCOL: PROTOCOL
+  };
+
+  // ---- DOM bootstrap ------------------------------------------------------
+
+  if (!globalThis.CODEX_DROP_TEST) {
+    var $ = function (id) { return document.getElementById(id); };
+    var ui = {
+      state: $('state'), message: $('message'), error: $('error'), connect: $('connect'), connectRow: $('connect-row'),
+      badge: $('session-badge'), chatSelect: $('chat-select'),
+      summary: $('target-summary'), facts: $('target-facts'), useChat: $('use-chat'), refresh: $('refresh-target'),
+      zone: $('zone'), choose: $('choose'), picker: $('picker'), limitsHint: $('limits-hint'),
+      queue: $('queue'), totals: $('totals'), attach: $('attach'), clear: $('clear'),
+      recovery: $('recovery'), recoveryText: $('recovery-text'), incidents: $('incidents'), inspect: $('inspect'),
+      inspected: $('inspected'), ack: $('ack'), allowNew: $('allow-new'), resultCard: $('result-card'), result: $('result'),
+      recentDetails: $('recent-details'), recent: $('recent'), retention: $('retention'), capacity: $('capacity')
+    };
+
+    var el = function (tag, cls, text) {
+      var n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text !== undefined && text !== null) n.textContent = String(text);
+      return n;
+    };
+
+    var plain = function (v) {
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'object') { try { return JSON.stringify(v).slice(0, 300); } catch (e) { return '[object]'; } }
+      return String(v);
+    };
+
+    var receiptChat = function (op) {
+      var target = op && (op.target || (op.result && op.result.target));
+      return target ? 'Chat: ' + chatLabel({ target: target }) + ' - ' + plain(target.thread) :
+        'Chat not recorded; check the intended Codex draft.';
+    };
+
+    var renderOperation = function (op) {
+      var box = el('div', 'op');
+      if (!op || typeof op !== 'object') { box.appendChild(el('p', 'bad', 'Unreadable receipt.')); return box; }
+      var ok = verified(op);
+      box.appendChild(el('h3', ok ? 'ok' : 'warn', ok ? 'Attached to Codex draft' : 'Not confirmed as attached'));
+      box.appendChild(el('p', 'mono', 'Operation ' + plain(op.operation_id) + ' - ' + plain(op.state) + (op.created_at ? ' - ' + plain(op.created_at) : '')));
+      box.appendChild(el('p', '', receiptChat(op)));
+      box.appendChild(el('p', ok ? 'ok' : 'warn', operationSummary(op)));
+      if (!ok && acknowledged(op)) {
+        box.appendChild(el('p', '', 'You marked this as checked' + (op.resolution.at ? ' at ' + plain(op.resolution.at) : '') + '. That is not proof it attached.'));
+      }
+      var r = op.result || {};
+      if (r.attach && r.attach.code) box.appendChild(el('p', 'mono', 'Code: ' + plain(r.attach.code)));
+      if (Array.isArray(r.files) && r.files.length) {
+        var ul = el('ul');
+        r.files.forEach(function (f) {
+          f = f || {};
+          var d = describeFileAttach(f.attach);
+          var li = el('li');
+          li.appendChild(el('span', '', plain(f.name || 'unnamed') + ' (' + formatBytes(f.size) + '): '));
+          li.appendChild(el('span', d.cls, d.text));
+          if (f.sha256) li.appendChild(el('div', 'mono', 'sha256 ' + plain(f.sha256)));
+          if (f.path) li.appendChild(el('div', 'mono', 'saved at ' + plain(f.path)));
+          ul.appendChild(li);
+        });
+        box.appendChild(ul);
+      } else if (r.ok === true) {
+        box.appendChild(el('p', 'bad', 'No per-image results were reported - treat as not attached.'));
+      }
+      return box;
+    };
+
+    var renderedChats = null;
+    var renderChats = function (s) {
+      if (renderedChats !== s.chats) {
+        renderedChats = s.chats;
+        var frag = document.createDocumentFragment();
+        var placeholder = el('option', '', s.chats.length ? 'Choose a chat…' : 'No Codex chats found');
+        placeholder.value = '-1';
+        placeholder.disabled = true;
+        frag.appendChild(placeholder);
+        s.chats.forEach(function (c, i) {
+          var o = el('option', '', chatLabel(c));
+          o.value = String(i);
+          frag.appendChild(o);
+        });
+        ui.chatSelect.replaceChildren(frag);
+      }
+      ui.chatSelect.value = String(s.selectedIndex);
+      ui.chatSelect.disabled = !s.nonce || s.busy || s.working || !s.chats.length;
+    };
+
+    var renderTarget = function (s) {
+      var t = s.target;
+      if (!t) {
+        ui.summary.textContent = !s.nonce ? 'No chat loaded yet.'
+          : (s.chats.length ? 'No chat selected. Choose one above.' : 'No Codex chats found. Open the chat on the home computer, then refresh the chat list.');
+        ui.facts.replaceChildren();
+        return;
+      }
+      var text = s.confirmed ? 'Attaching to this chat.' : 'Not confirmed yet - check it, then choose "Use this chat".';
+      if (s.composer && s.composer !== 'ready') text += ' Codex is ' + plain(s.composer) + ' right now.';
+      if (s.chatsTruncated) text += ' Only the first ' + s.chats.length + ' chats are listed.';
+      ui.summary.textContent = text;
+      var rows = [
+        ['Current chat', s.isDefault ? 'yes' : 'no'], ['Thread', t.thread], ['Session', t.session], ['Window', t.window],
+        ['Window name', t.window_name], ['Pane', t.pane], ['Pane PID', t.pane_pid], ['Codex PID', t.tui_pid],
+        ['Codex start', t.tui_start], ['Socket', t.socket], ['Composer', s.composer]
+      ];
+      var frag = document.createDocumentFragment();
+      rows.forEach(function (row) {
+        if (row[1] === null || row[1] === undefined || row[1] === '') return;
+        frag.appendChild(el('dt', '', row[0]));
+        frag.appendChild(el('dd', '', plain(row[1])));
+      });
+      ui.facts.replaceChildren(frag);
+    };
+
+    var renderedQueue = null;
+    var renderQueue = function (s) {
+      var key = s.queueRev + ':' + s.busy;
+      if (renderedQueue === key) return;
+      renderedQueue = key;
+      var frag = document.createDocumentFragment();
+      s.queue.forEach(function (it, i) {
+        var li = el('li');
+        if (it.url) {
+          var img = el('img');
+          img.src = it.url;
+          img.alt = '';
+          li.appendChild(img);
+        }
+        li.appendChild(el('span', 'name', it.name));
+        li.appendChild(el('span', 'size', formatBytes(it.size)));
+        var b = el('button', '', 'Remove');
+        b.type = 'button';
+        b.disabled = s.busy;
+        b.setAttribute('aria-label', 'Remove ' + it.name);
+        b.addEventListener('click', function () { controller.remove(i); });
+        li.appendChild(b);
+        frag.appendChild(li);
+      });
+      ui.queue.replaceChildren(frag);
+      var total = s.queue.reduce(function (sum, it) { return sum + itemSize(it); }, 0);
+      ui.totals.textContent = s.queue.length
+        ? s.queue.length + ' of ' + s.limits.max_files + ' screenshots, ' + formatBytes(total) + ' of ' + formatBytes(s.limits.max_batch)
+        : 'No screenshots selected.';
+    };
+
+    var stateText = function (s, pending) {
+      var n = s.inflight.length;
+      if (s.reloadRequired) return 'This page is out of date - reload it.';
+      if (s.busy) {
+        switch (s.stage) {
+          case 'preparing': return 'Preparing ' + n + ' screenshot(s) on this device…';
+          case 'reserving': return 'Reserving an upload on the home computer…';
+          case 'transferring': return 'Sending ' + n + ' screenshot(s) and attaching them to the draft… keep this page open.';
+          case 'checking': return 'Checking the upload receipt… nothing will be resent.';
+          default: return 'Working…';
+        }
+      }
+      if (s.working) return 'Checking…';
+      if (!s.nonce || !s.connected) return 'Not connected.';
+      if (pending) return 'Paused - check your Codex draft before uploading again.';
+      if (!s.target) return 'Choose a chat to attach screenshots to.';
+      if (!s.confirmed) return 'Check the chat, then choose "Use this chat".';
+      if (s.stage === 'attached') return 'Ready - attached. Review and send in Codex; more screenshots attach automatically.';
+      if (s.armed) return 'Ready - dropped, pasted or chosen screenshots attach automatically.';
+      return 'Ready - tap "Attach selected" to upload.';
+    };
+
+    var renderSession = function (s) {
+      if (!s.nonce) { ui.badge.hidden = true; return; }
+      var left = sessionRemaining(s, s.now);
+      ui.badge.hidden = false;
+      ui.badge.className = left > 0 ? 'badge' : 'badge warn';
+      ui.badge.textContent = left > 0
+        ? 'Session ' + (left < 60000 ? 'under 1' : String(Math.ceil(left / 60000))) + ' min left'
+        : 'Session expired - renews on your next action';
+    };
+
+    var renderStorage = function (s) {
+      var r = s.retention;
+      var text = 'Saved copies on the home computer become eligible for cleanup after ' + r.days + ' days. Copies are kept longer while any home Codex process is running, safety checks are incomplete, or an upload still needs checking. Continuously running Codex can keep copies indefinitely. Later history recall may need files that have expired.';
+      if (r.held !== null) text += ' Kept longer right now: ' + r.held + '.';
+      if (r.managed !== null) text += ' Tracked copies: ' + r.managed + '.';
+      if (r.last_run) text += ' Last cleanup: ' + plain(r.last_run) + '.';
+      ui.retention.textContent = text;
+      ui.retention.className = 'hint';
+      if (r.last_error) {
+        ui.retention.textContent = text + ' Last cleanup problem: ' + plain(r.last_error) + '. Automatic cleanup will check again later.';
+        ui.retention.className = 'warn';
+      }
+      var cap = s.unresolvedCapacity;
+      if (cap === null) { ui.capacity.textContent = s.unresolved ? 'Uploads waiting to be checked: ' + s.unresolved + '.' : ''; ui.capacity.className = 'hint'; return; }
+      var full = s.unresolved >= cap;
+      ui.capacity.textContent = 'Uploads waiting to be checked: ' + s.unresolved + ' of ' + cap + '.' + (full ? ' New uploads are refused until some are checked.' : '');
+      ui.capacity.className = full ? 'bad' : 'hint';
+    };
+
+    var renderRecovery = function (s, pending) {
+      ui.recovery.hidden = !pending;
+      if (!pending) return;
+      var open = s.inspected && s.inspected.kind;
+      if (open === 'expired') ui.recoveryText.textContent = expiredText(s.inspected.operation_id) + ' ' + STILL_QUEUED;
+      else if (s.operationId) ui.recoveryText.textContent = 'Operation ' + s.operationId + ' was not confirmed as attached. ' + STILL_QUEUED + ' Nothing will be retried automatically.';
+      else ui.recoveryText.textContent = 'Recent uploads were not confirmed as attached. Check every listed upload and its affected Codex draft before uploading again.';
+
+      var list = document.createDocumentFragment();
+      var seen = {};
+      (s.recent || []).concat(s.lastOperation ? [s.lastOperation] : []).forEach(function (op) {
+        if (!isIncident(op) || seen[op.operation_id]) return;
+        seen[op.operation_id] = true;
+        var item = el('li');
+        item.appendChild(el('div', 'mono', plain(op.operation_id) + ' - ' + plain(op.state) + (op.created_at ? ' - ' + plain(op.created_at) : '')));
+        item.appendChild(el('div', '', receiptChat(op)));
+        list.appendChild(item);
+      });
+      var listed = Object.keys(seen).length;
+      if (s.unresolved > listed) list.appendChild(el('li', 'warn', 'The home computer reports ' + s.unresolved + ' unchecked uploads but lists ' + listed + '. Reload the page.'));
+      ui.incidents.replaceChildren(list);
+
+      ui.inspect.textContent = s.receiptInspected ? 'Check again' : 'Check upload status';
+      ui.inspect.disabled = s.busy || s.working || !s.nonce;
+      if (!s.receiptInspected) ui.ack.checked = false;
+      ui.ack.disabled = !s.receiptInspected || s.busy || s.working;
+      ui.allowNew.disabled = !(s.receiptInspected && ui.ack.checked && s.confirmed && !s.busy && !s.working);
+
+      var ins = document.createDocumentFragment();
+      if (s.inspected) {
+        if (s.inspected.kind === 'operation') ins.appendChild(renderOperation(s.inspected.operation));
+        else if (s.inspected.kind === 'missing') ins.appendChild(el('p', 'warn', missingText(s.inspected.operation_id)));
+        else if (s.inspected.kind === 'expired') ins.appendChild(el('p', 'warn', expiredText(s.inspected.operation_id)));
+        else if (s.inspected.kind === 'list') ins.appendChild(el('p', '', 'Uploads to check: ' + s.inspected.count + '. Details are under "Storage and recent receipts".'));
+        if (s.receiptInspected && !s.confirmed) ins.appendChild(el('p', 'warn', 'Use this chat before marking the upload as checked.'));
+      }
+      ui.inspected.replaceChildren(ins);
+    };
+
+    var renderDom = function (s) {
+      var pending = hasPendingUncertainty(s);
+      ui.state.textContent = stateText(s, pending);
+      ui.message.textContent = s.message || '';
+      ui.error.textContent = s.error ? s.error.message : '';
+      renderSession(s);
+
+      ui.connectRow.hidden = s.connected && !!s.nonce;
+      ui.connect.textContent = s.reloadRequired ? 'Reload required' : (s.nonce ? 'Reconnect' : 'Connect');
+      ui.connect.disabled = s.busy || s.working || s.reloadRequired;
+      renderChats(s);
+      ui.useChat.disabled = !s.targetId || s.busy || s.working || s.confirmed;
+      ui.useChat.textContent = s.confirmed ? 'Using this chat' : 'Use this chat';
+      ui.refresh.disabled = !s.nonce || s.busy || s.working;
+      renderTarget(s);
+
+      ui.limitsHint.textContent = 'PNG, JPEG, GIF or WebP; up to ' + s.limits.max_files + ' screenshots, ' +
+        formatBytes(s.limits.max_image) + ' each, ' + formatBytes(s.limits.max_batch) + ' total. HEIC is not supported.';
+      ui.choose.disabled = s.busy;
+      ui.zone.classList.toggle('disabled', s.busy);
+      ui.zone.setAttribute('aria-busy', s.busy ? 'true' : 'false');
+      renderQueue(s);
+      ui.attach.disabled = s.busy || s.working || !s.confirmed || !s.queue.length || pending || s.reloadRequired;
+      ui.clear.disabled = s.busy || !s.queue.length;
+
+      renderRecovery(s, pending);
+
+      ui.resultCard.hidden = !s.lastOperation;
+      ui.result.replaceChildren(s.lastOperation ? renderOperation(s.lastOperation) : el('span'));
+
+      renderStorage(s);
+      var rec = document.createDocumentFragment();
+      if (!s.recent || !s.recent.length) rec.appendChild(el('p', '', 'No recent receipts.'));
+      else s.recent.forEach(function (op) { rec.appendChild(renderOperation(op)); });
+      ui.recent.replaceChildren(rec);
+    };
+
+    var controller = createController({
+      render: renderDom,
+      timers: { setTimeout: function (f, ms) { return setTimeout(f, ms); }, clearTimeout: function (h) { clearTimeout(h); } }
+    });
+
+    ui.connect.addEventListener('click', function () { controller.connect(); });
+    ui.chatSelect.addEventListener('change', function () {
+      var i = Number(ui.chatSelect.value);
+      if (i >= 0) controller.selectChat(i);
+    });
+    ui.useChat.addEventListener('click', function () { controller.confirmChat(); });
+    ui.refresh.addEventListener('click', function () { controller.refreshTarget(); });
+    ui.choose.addEventListener('click', function () { ui.picker.click(); });
+    ui.picker.addEventListener('change', function () {
+      var files = Array.prototype.slice.call(ui.picker.files || []);
+      ui.picker.value = '';
+      controller.addFiles(files);
+    });
+    ui.attach.addEventListener('click', function () { controller.send(); });
+    ui.clear.addEventListener('click', function () { controller.clear(); });
+    ui.inspect.addEventListener('click', function () { controller.inspect(); });
+    ui.ack.addEventListener('change', function () { renderDom(controller.state); });
+    ui.allowNew.addEventListener('click', function () {
+      var checked = ui.ack.checked === true;
+      controller.retry(checked).then(function (ok) {
+        if (ok) ui.ack.checked = false;
+        renderDom(controller.state);
+      });
+    });
+
+    var dragDepth = 0;
+    var hasFiles = function (e) {
+      var types = e.dataTransfer && e.dataTransfer.types;
+      return !!types && Array.prototype.indexOf.call(types, 'Files') !== -1;
+    };
+    document.addEventListener('dragenter', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth += 1;
+      ui.zone.classList.add('dragging');
+    });
+    document.addEventListener('dragleave', function (e) {
+      if (!hasFiles(e)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) ui.zone.classList.remove('dragging');
+    });
+    document.addEventListener('dragover', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = controller.state.busy ? 'none' : 'copy';
+    });
+    document.addEventListener('drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth = 0;
+      ui.zone.classList.remove('dragging');
+      controller.addFiles(Array.prototype.slice.call(e.dataTransfer.files || []));
+    });
+    document.addEventListener('paste', function (e) {
+      var files = e.clipboardData && e.clipboardData.files;
+      if (!files || !files.length) return;
+      e.preventDefault();
+      controller.addFiles(Array.prototype.slice.call(files));
+    });
+    // Coming back to the page only refreshes readiness; it never uploads.
+    var wake = function () {
+      if (document.visibilityState === 'hidden') return;
+      controller.resume();
+    };
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    window.addEventListener('pageshow', wake);
+    window.addEventListener('online', wake);
+    // Leaving mid-upload does not cancel anything; warn so the user knows to
+    // check receipts afterwards.
+    window.addEventListener('beforeunload', function (e) {
+      if (controller.state.busy) { e.preventDefault(); e.returnValue = ''; }
+    });
+
+    controller.connect();
+  }
+})();
+</script>
+</body>
+</html>

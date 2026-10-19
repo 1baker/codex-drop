@@ -1,0 +1,1220 @@
+#!/usr/bin/env python3
+"""Private Tailscale Serve -> loopback -> fixed Codex receiver adapter.
+
+Importing this module opens no sockets. Only main() starts a listener.
+Local processes are within the host trust boundary; Serve must own ingress.
+"""
+import argparse
+import base64
+import contextlib
+import datetime
+import fcntl
+import hashlib
+import http.server
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import selectors
+import signal
+import sqlite3
+import stat
+import struct
+import subprocess
+import threading
+import time
+import uuid
+
+
+THREAD = '00000000-0000-4000-8000-000000000000'
+SOCKET = 'default'
+RECEIVER = '/home/YOUR_HOME_USER/.local/bin/codex-drop'
+MAX_IMAGE = 25 * 1024 * 1024
+MAX_BATCH = 50 * 1024 * 1024
+MAX_BODY = 80 * 1024 * 1024 - 8192
+MAX_FRAME = 80 * 1024 * 1024
+MAX_REPLY = 1024 * 1024
+MAX_FILES = 10
+MAX_UNRESOLVED = 64
+RECENT_OPERATIONS = 32
+RETENTION_SECONDS = 7 * 24 * 60 * 60
+TICKET_TTL = 300
+SESSION_TTL = 900
+MAX_SESSIONS = 32
+BODY_TIMEOUT = 120
+RECEIVER_TIMEOUT = 120
+IDENTITY = ('thread', 'socket', 'pane', 'pane_pid', 'window', 'tui_pid', 'tui_start')
+PUBLIC_TARGET = IDENTITY + ('session', 'window_name')
+IDENTITY_UID_MAP = ((0, 0, 4294967295),)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class Refusal(Exception):
+    def __init__(self, code, message, status=400):
+        super().__init__(message)
+        self.code, self.message, self.status = code, message, status
+
+
+def fail(code, message, status=400):
+    raise Refusal(code, message, status)
+
+
+def error(code, message):
+    return {'ok': False, 'error': {'code': code, 'message': message}}
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+                      allow_nan=False).encode('ascii')
+
+
+def decode_json(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                fail('json', 'Duplicate JSON keys are refused')
+            result[key] = value
+        return result
+
+    try:
+        result = json.loads(raw, object_pairs_hook=unique,
+                            parse_constant=lambda _: fail('json', 'Invalid JSON number'))
+    except (ValueError, UnicodeError, RecursionError):
+        fail('json', 'Expected a bounded JSON object')
+    if not isinstance(result, dict):
+        fail('json', 'Expected a JSON object')
+    return result
+
+
+def exact_keys(obj, keys):
+    if not isinstance(obj, dict) or set(obj) != set(keys):
+        fail('fields', 'Unexpected or missing request fields')
+
+
+def operation_id(value):
+    if not isinstance(value, str):
+        fail('operation_id', 'Expected an operation UUID')
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError()
+    except ValueError:
+        fail('operation_id', 'Expected a canonical operation UUID')
+    return value
+
+
+def image_kind(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpeg'
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return 'gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
+
+def validate_images(images, target=None):
+    if not isinstance(images, list) or not 1 <= len(images) <= MAX_FILES:
+        fail('images', 'Choose between 1 and 10 screenshots')
+    total = 0
+    manifest = []
+    for image in images:
+        exact_keys(image, ('name', 'size', 'sha256', 'data'))
+        name, size, digest, encoded = (image[k] for k in ('name', 'size', 'sha256', 'data'))
+        if not isinstance(name, str) or not 1 <= len(name) <= 255 or any(
+                ord(c) < 32 or ord(c) == 127 for c in name):
+            fail('name', 'Screenshot names must be short plain text')
+        if type(size) is not int or not 1 <= size <= MAX_IMAGE:
+            fail('size', 'Each screenshot must be at most 25 MiB', 413)
+        total += size
+        if total > MAX_BATCH:
+            fail('size', 'The batch must be at most 50 MiB', 413)
+        if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
+            fail('digest', 'Invalid screenshot digest')
+        if not isinstance(encoded, str) or len(encoded) != 4 * ((size + 2) // 3):
+            fail('size', 'Screenshot byte count does not match')
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeError):
+            fail('image', 'Invalid screenshot encoding')
+        if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+            fail('digest', 'Screenshot bytes do not match their digest')
+        if image_kind(raw) is None:
+            fail('format', 'Use PNG, JPEG, GIF or WebP screenshots')
+        manifest.append({'name': name, 'size': size, 'sha256': digest})
+    if target is None:  # Retained legacy receipts are readback-only.
+        return hashlib.sha256(canonical({'thread': THREAD, 'images': manifest})).hexdigest()
+    identity = {key: target[key] for key in IDENTITY}
+    return 'v2:' + hashlib.sha256(canonical({'target': identity, 'images': manifest})).hexdigest()
+
+
+def _read_proc_text(path):
+    with open(path, 'rb') as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        fail('state_namespace', 'Namespace metadata exceeds its limit')
+    try:
+        return raw.decode('ascii')
+    except UnicodeError:
+        fail('state_namespace', 'Invalid namespace metadata')
+
+
+def read_uid_map():
+    rows = []
+    for line in _read_proc_text('/proc/self/uid_map').splitlines():
+        fields = line.split()
+        if len(fields) != 3 or any(not re.fullmatch('[0-9]{1,10}', value) for value in fields):
+            fail('state_namespace', 'Invalid UID mapping')
+        inside, outside, count = map(int, fields)
+        if count <= 0 or inside + count > 4294967295 or outside + count > 4294967295:
+            fail('state_namespace', 'Invalid UID mapping range')
+        rows.append((inside, outside, count))
+    if not rows:
+        fail('state_namespace', 'Missing UID mapping')
+    for column in (0, 1):
+        ordered = sorted(rows, key=lambda row: row[column])
+        if any(left[column] + left[2] > right[column]
+               for left, right in zip(ordered, ordered[1:])):
+            fail('state_namespace', 'Overlapping UID mapping ranges')
+    return tuple(rows)
+
+
+def read_overflow_uid():
+    raw = _read_proc_text('/proc/sys/kernel/overflowuid').strip()
+    if not re.fullmatch('[0-9]{1,10}', raw) or int(raw) >= 4294967295:
+        fail('state_namespace', 'Invalid overflow UID')
+    return int(raw)
+
+
+def state_path():
+    # This fixed path is shared by both startup modes; the config schema is unchanged.
+    return Path.home() / '.local/state/codex-drop-web'
+
+
+def _mapped(uid, mapping, column=0):
+    return any(row[column] <= uid < row[column] + row[2] for row in mapping)
+
+
+def _sandbox_overflow_owner():
+    if not os.environ.get('INVOCATION_ID'):
+        return None
+    mapping = read_uid_map()
+    overflow = read_overflow_uid()
+    if (mapping == IDENTITY_UID_MAP or _mapped(0, mapping) or
+            _mapped(0, mapping, 1) or _mapped(overflow, mapping)):
+        return None
+    return overflow
+
+
+def _directory_owner(info, final, overflow_owner=None):
+    if final:
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            fail('state', 'State directory must be owned by this user and mode 0700')
+    elif overflow_owner is not None and info.st_uid == overflow_owner:
+        if info.st_mode & 0o022:
+            fail('state', 'Unmapped ancestor must not be group or other writable')
+    elif info.st_uid not in (0, os.geteuid()) or (
+            info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)):
+        fail('state', 'Unsafe state directory ancestor')
+
+
+def check_ancestors(path, config_path=None):
+    """Read-only gate: require real UID visibility, then strictly verify every fd."""
+    if read_uid_map() != IDENTITY_UID_MAP:
+        fail('state_namespace', 'Ownership gate requires an identity UID mapping')
+    overflow = read_overflow_uid()
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts or path == Path('/'):
+        fail('state', 'State path must be absolute')
+    fd = os.open('/', DIR_FLAGS)
+    try:
+        home_fd = os.open('home', DIR_FLAGS, dir_fd=fd)
+        try:
+            if os.fstat(home_fd).st_uid == overflow:
+                fail('state_namespace', 'Ownership gate cannot see the real home ancestor')
+        finally:
+            os.close(home_fd)
+        if config_path is not None:
+            load_config(config_path)
+        for index, part in enumerate(path.parts[1:]):
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            _directory_owner(os.fstat(fd), index == len(path.parts) - 2)
+    finally:
+        os.close(fd)
+
+
+def private_directory(path, create=True):
+    """Create/open private state through directory fds without following links."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts or path == Path('/'):
+        fail('state', 'State path must be absolute')
+    overflow_owner = _sandbox_overflow_owner()
+    fd = os.open('/', DIR_FLAGS)
+    try:
+        for index, part in enumerate(path.parts[1:]):
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            final = index == len(path.parts) - 2
+            _directory_owner(info, final, overflow_owner)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def private_file(dir_fd, name):
+    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+            stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+        os.close(fd)
+        fail('state', 'State files must be private regular files')
+    return fd
+
+
+def now_string():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+
+def screenshot_store():
+    return Path.home() / '.local/share/codex-drop/screenshots'
+
+
+def verified_operation(receipt):
+    result = receipt.get('result', {})
+    files = result.get('files')
+    return (receipt.get('state') == 'completed' and result.get('ok') is True and
+            result.get('attach', {}).get('state') == 'verified' and
+            isinstance(files, list) and bool(files) and
+            all(isinstance(item, dict) and item.get('attach') == 'attached-verified'
+                for item in files))
+
+
+def managed_relative(value, store):
+    try:
+        relative = Path(value).relative_to(store)
+    except (TypeError, ValueError):
+        fail('managed_file', 'Receiver returned an invalid managed screenshot path')
+    if (len(relative.parts) != 2 or
+            not re.fullmatch(r'[0-9]{8}-[0-9]{6}-[0-9a-f]{16}', relative.parts[0]) or
+            not re.fullmatch(r'[0-9]{2}-[0-9a-f]{12}\.(?:png|jpe?g|gif|webp)', relative.parts[1])):
+        fail('managed_file', 'Receiver returned an invalid managed screenshot path')
+    return relative.as_posix()
+
+
+class Journal:
+    def __init__(self, path, store=None):
+        self.path = Path(path)
+        self.dir_fd = private_directory(self.path)
+        self.lock_fd = private_file(self.dir_fd, 'instance.lock')
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.lock_fd)
+            os.close(self.dir_fd)
+            fail('instance', 'Another adapter owns this state directory', 503)
+        fd = private_file(self.dir_fd, 'receipts.sqlite3')
+        os.close(fd)
+        self.lock = threading.RLock()
+        self.store = Path(store) if store is not None else screenshot_store()
+        self.db = sqlite3.connect(str(self.path / 'receipts.sqlite3'), check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=DELETE')
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.execute('PRAGMA max_page_count=2048')
+        self.db.execute('CREATE TABLE IF NOT EXISTS operations '
+                        '(id TEXT PRIMARY KEY, fingerprint TEXT, receipt TEXT)')
+        # Keep the original three-column table compatible with the rollback
+        # reader. New state is additive; original receipt JSON never changes.
+        with self.db:
+            self.db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS legacy_ids (id TEXT PRIMARY KEY)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS operation_order '
+                            '(id TEXT PRIMARY KEY, sequence INTEGER UNIQUE NOT NULL)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS resolutions (id TEXT PRIMARY KEY, at TEXT)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS managed_files '
+                            '(relpath TEXT PRIMARY KEY, op_id TEXT, thread TEXT, sha256 TEXT, '
+                            'size INTEGER, created REAL, state TEXT)')
+            sequence = self._number('sequence')
+            ticket_counter = self._number('ticket_counter')
+            migrate_files = self._number('provenance_migration') == 0
+            for ident, fingerprint, raw in self.db.execute(
+                    'SELECT id,fingerprint,receipt FROM operations ORDER BY rowid').fetchall():
+                parsed = uuid.UUID(ident)
+                if parsed.version == 8 and parsed.variant == uuid.RFC_4122 and fingerprint.startswith('v2:'):
+                    ticket_counter = max(ticket_counter, parsed.int & ((1 << 62) - 1))
+                elif not fingerprint.startswith('v2:'):
+                    self.db.execute('INSERT OR IGNORE INTO legacy_ids VALUES (?)', (ident,))
+                if not self.db.execute('SELECT 1 FROM operation_order WHERE id=?', (ident,)).fetchone():
+                    sequence += 1
+                    self.db.execute('INSERT INTO operation_order VALUES (?,?)', (ident, sequence))
+                if migrate_files:
+                    self._register_files(json.loads(raw), legacy=True)
+            self._set_number('sequence', sequence)
+            self._set_number('ticket_counter', ticket_counter)
+            self._set_number('provenance_migration', 1)
+        os.fsync(self.dir_fd)
+
+    def _number(self, key):
+        row = self.db.execute('SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+        if row is None:
+            return 0
+        if not isinstance(row[0], str) or not re.fullmatch('[0-9]{1,19}', row[0]):
+            fail('journal_state', 'Invalid journal counter; no operation dispatched', 503)
+        value = int(row[0])
+        if value >= 1 << 63:
+            fail('journal_state', 'Journal counter exceeds its limit', 503)
+        return value
+
+    def _set_number(self, key, value):
+        self.db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, str(value)))
+
+    def issue_id(self):
+        # A durable, never-recycled counter occupies the UUID's low 62 bits.
+        # Compaction therefore cannot accidentally mint a past operation ID,
+        # even if the random prefix repeats. No durable prepared ticket exists.
+        for _ in range(1024):
+            with self.lock, self.db:
+                counter = self._number('ticket_counter') + 1
+                if counter >= 1 << 62:
+                    fail('journal_full', 'Operation identifier space exhausted', 503)
+                self._set_number('ticket_counter', counter)
+            os.fsync(self.dir_fd)
+            upper = (secrets.randbits(64) & ~(15 << 12)) | (8 << 12)
+            ident = str(uuid.UUID(int=(upper << 64) | (2 << 62) | counter))
+            with self.lock:
+                if not self.db.execute('SELECT 1 FROM legacy_ids WHERE id=?', (ident,)).fetchone() and not self.get(ident):
+                    return ident
+        fail('journal_full', 'Operation identifier collision limit reached', 503)
+
+    def close(self):
+        self.db.close()
+        os.close(self.lock_fd)
+        os.close(self.dir_fd)
+
+    def get(self, ident):
+        with self.lock:
+            row = self.db.execute('SELECT fingerprint,receipt FROM operations WHERE id=?',
+                                  (ident,)).fetchone()
+            return (row[0], json.loads(row[1])) if row else None
+
+    def recent(self):
+        with self.lock:
+            output, settled = [], 0
+            for ident, receipt, resolution in self._entries():
+                if verified_operation(receipt) or resolution:
+                    settled += 1
+                    if settled > RECENT_OPERATIONS:
+                        continue
+                if resolution:
+                    receipt['resolution'] = resolution
+                output.append(receipt)
+            return output
+
+    def _entries(self):
+        rows = self.db.execute('SELECT o.id,o.receipt,r.at FROM operations o '
+                               'LEFT JOIN resolutions r ON r.id=o.id '
+                               'LEFT JOIN operation_order s ON s.id=o.id '
+                               'ORDER BY s.sequence DESC,o.rowid DESC').fetchall()
+        return [(ident, json.loads(raw), {'state': 'acknowledged', 'at': at} if at else None)
+                for ident, raw, at in rows]
+
+    def unresolved(self):
+        with self.lock:
+            return sum(not verified_operation(receipt) and not resolution
+                       for _, receipt, resolution in self._entries())
+
+    def resolution(self, ident):
+        with self.lock:
+            row = self.db.execute('SELECT at FROM resolutions WHERE id=?', (ident,)).fetchone()
+            return {'state': 'acknowledged', 'at': row[0]} if row else None
+
+    def _compact(self):
+        settled = 0
+        for ident, receipt, resolution in self._entries():
+            if not (verified_operation(receipt) or resolution):
+                continue
+            settled += 1
+            if settled > RECENT_OPERATIONS:
+                self.db.execute('DELETE FROM operations WHERE id=?', (ident,))
+                self.db.execute('DELETE FROM resolutions WHERE id=?', (ident,))
+                self.db.execute('DELETE FROM operation_order WHERE id=?', (ident,))
+
+    def reserve(self, ident, fingerprint, target=None):
+        with self.lock:
+            if self.get(ident) is not None:
+                fail('operation_conflict', 'Operation already reserved', 409)
+            if self.unresolved() >= MAX_UNRESOLVED:
+                fail('journal_full', 'Check unresolved uploads before preparing another', 503)
+            receipt = {'operation_id': ident, 'state': 'uncertain', 'created_at': now_string(),
+                       'result': error('outcome_uncertain',
+                                       'Reserved operation; inspect Codex before any new upload')}
+            if target is not None:
+                receipt['target'] = {key: target[key] for key in PUBLIC_TARGET}
+            with self.db:
+                self.db.execute('INSERT INTO operations VALUES (?,?,?)',
+                                (ident, fingerprint, canonical(receipt).decode()))
+                sequence = self._number('sequence') + 1
+                self._set_number('sequence', sequence)
+                self.db.execute('INSERT INTO operation_order VALUES (?,?)', (ident, sequence))
+            os.fsync(self.dir_fd)
+            return receipt
+
+    def finish(self, ident, receipt):
+        with self.lock, self.db:
+            self.db.execute('UPDATE operations SET receipt=? WHERE id=?',
+                            (canonical(receipt).decode(), ident))
+            self._register_files(receipt)
+            self._compact()
+        os.fsync(self.dir_fd)
+
+    def acknowledge(self, ident):
+        with self.lock, self.db:
+            found = self.get(ident)
+            if found is None:
+                fail('receipt_missing', 'No receipt is available; inspect the actual draft', 404)
+            previous = self.resolution(ident)
+            if previous:
+                return previous
+            if verified_operation(found[1]):
+                fail('already_verified', 'This upload is already verified', 409)
+            at = now_string()
+            self.db.execute('INSERT INTO resolutions VALUES (?,?)', (ident, at))
+            self.db.execute("UPDATE managed_files SET state='resolved' WHERE op_id=?", (ident,))
+            self._compact()
+        os.fsync(self.dir_fd)
+        return {'state': 'acknowledged', 'at': at}
+
+    def _register_files(self, receipt, legacy=False):
+        result = receipt.get('result', {})
+        target = receipt.get('target') or result.get('target') or {'thread': THREAD}
+        thread = target.get('thread')
+        try:
+            if not isinstance(thread, str) or str(uuid.UUID(thread)) != thread:
+                raise ValueError()
+            timestamp = datetime.datetime.fromisoformat(receipt['created_at'])
+            if timestamp.tzinfo is None:
+                raise ValueError()
+            created = timestamp.timestamp()
+            if not math.isfinite(created) or created <= 0:
+                raise ValueError()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return  # Unknown legacy provenance is never adopted for deletion.
+        for item in result.get('files', []):
+            if not isinstance(item, dict) or not item.get('path'):
+                continue
+            try:
+                relative = managed_relative(item['path'], self.store)
+                if (type(item.get('size')) is not int or not 1 <= item['size'] <= MAX_IMAGE or
+                        not isinstance(item.get('sha256'), str) or
+                        not re.fullmatch('[0-9a-f]{64}', item['sha256'])):
+                    raise ValueError()
+            except (Refusal, ValueError):
+                if legacy:
+                    continue
+                fail('managed_file', 'Invalid receiver screenshot metadata')
+            state = 'verified' if verified_operation(receipt) else 'unresolved'
+            if self.resolution(receipt['operation_id']):
+                state = 'resolved'
+            record = (relative, receipt['operation_id'], thread, item['sha256'],
+                      item['size'], created, state)
+            previous = self.db.execute('SELECT * FROM managed_files WHERE relpath=?',
+                                       (relative,)).fetchone()
+            if previous is not None and previous[:6] != record[:6]:
+                if legacy:
+                    continue
+                fail('managed_file', 'Managed screenshot provenance conflicts')
+            if previous is None:
+                self.db.execute('INSERT INTO managed_files VALUES (?,?,?,?,?,?,?)', record)
+
+
+def pump_process(proc, data, timeout, limit=MAX_REPLY, clock=time.monotonic, kill=None):
+    """Bound both output pipes and wall time while writing input, without communicate()."""
+    kill = kill or (lambda: os.killpg(proc.pid, signal.SIGKILL))
+    end = clock() + timeout
+    result = {'out': bytearray(), 'err': bytearray()}
+    view = memoryview(data)
+    sent = 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, kind, events in ((proc.stdin, 'in', selectors.EVENT_WRITE),
+                                         (proc.stdout, 'out', selectors.EVENT_READ),
+                                         (proc.stderr, 'err', selectors.EVENT_READ)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, events, kind)
+            while selector.get_map() or proc.poll() is None:
+                remaining = end - clock()
+                if remaining <= 0:
+                    fail('receiver_timeout', 'Receiver outcome is uncertain', 503)
+                for key, _ in selector.select(min(remaining, 0.1)):
+                    if key.data == 'in':
+                        try:
+                            n = os.write(key.fd, view[sent:sent + 65536])
+                        except BrokenPipeError:
+                            n = 0
+                            sent = len(view)
+                        except BlockingIOError:
+                            continue
+                        sent += n
+                        if sent >= len(view):
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                    else:
+                        try:
+                            chunk = os.read(key.fd, min(65536, limit + 1 - len(result[key.data])))
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                        else:
+                            result[key.data].extend(chunk)
+                            if len(result[key.data]) > limit:
+                                fail('receiver_output', 'Receiver output limit exceeded', 503)
+            if proc.wait(timeout=max(0.01, end - clock())) != 0:
+                fail('receiver_failed', 'Receiver outcome is uncertain', 503)
+            return bytes(result['out'])
+    except BaseException:
+        with contextlib.suppress(OSError):
+            kill()  # Also stop descendants retaining pipes after the parent exits.
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=2)
+        raise
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
+class Receiver:
+    def __call__(self, request):
+        payload = canonical(request)
+        if len(payload) > MAX_FRAME:
+            fail('frame', 'Receiver request exceeds its frame limit', 413)
+        proc = subprocess.Popen(['python3', '-I', RECEIVER, 'receive'], shell=False,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
+                                env={'PATH': '/usr/bin:/bin', 'HOME': str(Path.home()),
+                                     'LANG': 'C.UTF-8'}, cwd=str(Path.home()))
+        reply = pump_process(proc, struct.pack('>I', len(payload)) + payload, RECEIVER_TIMEOUT)
+        if not reply.endswith(b'\n') or b'\n' in reply[:-1]:
+            fail('receiver_reply', 'Receiver outcome is uncertain', 503)
+        value = decode_json(reply)
+        if type(value.get('ok')) is not bool:
+            fail('receiver_reply', 'Receiver outcome is uncertain', 503)
+        return value
+
+
+def csp(page):
+    sources = {}
+    for tag in ('script', 'style'):
+        blocks = re.findall(r'<' + tag + r'(?:\s[^>]*)?>(.*?)</' + tag + '>',
+                            page.decode('utf-8'), re.S | re.I)
+        sources[tag] = ' '.join("'sha256-" + base64.b64encode(
+            hashlib.sha256(b.encode('utf-8')).digest()).decode() + "'" for b in blocks)
+    return ("default-src 'none'; script-src " + (sources['script'] or "'none'") +
+            '; style-src ' + (sources['style'] or "'none'") +
+            "; connect-src 'self'; img-src blob:; base-uri 'none'; frame-ancestors 'none'; "
+            "form-action 'none'; object-src 'none'")
+
+
+class App:
+    def __init__(self, host, allowed_login, state_dir, page=None, receiver=None,
+                 clock=time.monotonic, store=None, wall_clock=time.time):
+        if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?:9443', host):
+            fail('config', 'Canonical host must be a DNS hostname with port 9443')
+        if not isinstance(allowed_login, str) or not allowed_login or any(
+                c.isspace() or ord(c) < 32 for c in allowed_login):
+            fail('config', 'Configure one exact Tailscale user login')
+        self.host, self.login, self.origin = host, allowed_login, 'https://' + host
+        self.page = page
+        self.receiver = receiver or Receiver()
+        self.clock = clock
+        self.wall_clock = wall_clock
+        self.store = Path(store) if store is not None else screenshot_store()
+        self.sessions, self.sessions_lock = {}, threading.RLock()
+        self.jobs = threading.Lock()
+        self.journal = Journal(state_dir, self.store)
+        self.retention = {'days': 7, 'managed': 0, 'held': 0,
+                          'last_run': None, 'last_error': None, 'deleted': 0}
+        self.maintenance_stop = threading.Event()
+        self.maintenance_thread = None
+
+    def start_maintenance(self):
+        if self.maintenance_thread is not None:
+            return
+        def run():
+            while not self.maintenance_stop.is_set():
+                self.maintenance()
+                self.maintenance_stop.wait(3600)
+        self.maintenance_thread = threading.Thread(target=run, name='screenshot-retention', daemon=True)
+        self.maintenance_thread.start()
+
+    @staticmethod
+    def thread_absent(thread, catalog):
+        return (catalog.get('tmux_ok') is True and catalog.get('complete') is True and
+                catalog.get('truncated') is False and
+                catalog.get('process_complete') is True and catalog.get('codex_present') is False and
+                isinstance(catalog.get('threads'), list) and
+                all(isinstance(value, str) and re.fullmatch(
+                    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value)
+                    for value in catalog['threads']) and thread not in catalog['threads'])
+
+    def unlink_managed(self, row, now):
+        relative, _, thread, digest, size, _, _ = row
+        managed_relative(str(self.store / relative), self.store)
+        batch, filename = Path(relative).parts
+        parent = private_directory(self.store.parent, create=False)
+        store_fd = batch_fd = file_fd = None
+        try:
+            store_fd = os.open(self.store.name, DIR_FLAGS, dir_fd=parent)
+            _directory_owner(os.fstat(store_fd), True)
+            try:
+                batch_fd = os.open(batch, DIR_FLAGS, dir_fd=store_fd)
+            except FileNotFoundError:
+                return 'missing'
+            _directory_owner(os.fstat(batch_fd), True)
+            try:
+                file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                  dir_fd=batch_fd)
+            except FileNotFoundError:
+                return 'missing'
+            before = os.fstat(file_fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or
+                    stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1 or
+                    before.st_size != size or before.st_mtime <= 0 or
+                    before.st_mtime > now - RETENTION_SECONDS):
+                return 'held'
+            actual, count = hashlib.sha256(), 0
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > MAX_IMAGE or self.maintenance_stop.is_set():
+                    return 'held'
+                actual.update(chunk)
+            after = os.fstat(file_fd)
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                                     info.st_ctime_ns, info.st_uid, info.st_mode, info.st_nlink)
+            if count != size or actual.hexdigest() != digest or identity(before) != identity(after):
+                return 'held'
+            # Native activity need not use our jobs lock. Recheck absence after
+            # reading the bytes rather than trusting the earlier catalog.
+            if not self.thread_absent(thread, self.presence()):
+                return 'held'
+            entry = os.stat(filename, dir_fd=batch_fd, follow_symlinks=False)
+            batch_entry = os.stat(batch, dir_fd=store_fd, follow_symlinks=False)
+            store_entry = os.stat(self.store.name, dir_fd=parent, follow_symlinks=False)
+            _directory_owner(batch_entry, True)
+            _directory_owner(store_entry, True)
+            if (identity(entry) != identity(after) or
+                    (batch_entry.st_dev, batch_entry.st_ino) !=
+                    (os.fstat(batch_fd).st_dev, os.fstat(batch_fd).st_ino) or
+                    (store_entry.st_dev, store_entry.st_ino) !=
+                    (os.fstat(store_fd).st_dev, os.fstat(store_fd).st_ino)):
+                return 'held'
+            os.unlink(filename, dir_fd=batch_fd)
+            os.fsync(batch_fd)
+            return 'deleted'
+        finally:
+            for fd in (file_fd, batch_fd, store_fd, parent):
+                if fd is not None:
+                    os.close(fd)
+
+    def maintenance(self):
+        status = {'days': 7, 'managed': 0, 'held': 0, 'deleted': 0,
+                  'last_run': now_string(), 'last_error': None}
+        admitted = skipped = False
+        try:
+            now = self.wall_clock()
+            if not math.isfinite(now) or now <= 0:
+                fail('retention_clock', 'Cleanup clock is unavailable')
+            with self.journal.lock:
+                rows = self.journal.db.execute("SELECT * FROM managed_files WHERE state<>'deleted'").fetchall()
+            status['managed'] = len(rows)
+            eligible = lambda row: (isinstance(row[5], (int, float)) and math.isfinite(row[5]) and
+                                    0 < row[5] <= now - RETENTION_SECONDS and
+                                    row[6] in ('verified', 'resolved'))
+            if not any(eligible(row) for row in rows):
+                status['held'] = sum(not isinstance(row[5], (int, float)) or
+                    not math.isfinite(row[5]) or row[5] <= 0 or row[5] > now or
+                    now - row[5] >= RETENTION_SECONDS for row in rows)
+                return status
+            if not self.jobs.acquire(blocking=False):
+                skipped = True
+                return {**self.retention, 'skipped': True}
+            admitted = True
+            with self.journal.lock:
+                rows = self.journal.db.execute("SELECT * FROM managed_files WHERE state<>'deleted'").fetchall()
+            status['managed'] = len(rows)
+            catalog = None
+            deadline = time.monotonic() + 30
+            for index, row in enumerate(rows):
+                if self.maintenance_stop.is_set() or time.monotonic() >= deadline:
+                    status['held'] += len(rows) - index
+                    status['last_error'] = 'cleanup_paused'
+                    break
+                _, _, thread, _, _, created, state = row
+                if not isinstance(created, (int, float)) or not math.isfinite(created) or created <= 0 or created > now:
+                    status['held'] += 1
+                    continue
+                if now - created < RETENTION_SECONDS:
+                    continue
+                if state not in ('verified', 'resolved'):
+                    status['held'] += 1
+                    continue
+                try:
+                    if catalog is None:
+                        catalog = self.presence()
+                    if not self.thread_absent(thread, catalog):
+                        status['held'] += 1
+                        continue
+                    result = self.unlink_managed(row, now)
+                    if result == 'held':
+                        status['held'] += 1
+                        continue
+                    with self.journal.lock, self.journal.db:
+                        self.journal.db.execute("UPDATE managed_files SET state='deleted' WHERE relpath=?", (row[0],))
+                    os.fsync(self.journal.dir_fd)
+                    status['managed'] -= 1
+                    if result == 'deleted':
+                        status['deleted'] += 1
+                except (Refusal, OSError, sqlite3.Error) as error:
+                    status['held'] += 1
+                    status['last_error'] = error.code if isinstance(error, Refusal) else type(error).__name__
+            return status
+        except (Refusal, OSError, sqlite3.Error) as error:
+            status['last_error'] = error.code if isinstance(error, Refusal) else type(error).__name__
+            return status
+        finally:
+            if admitted:
+                self.jobs.release()
+            if not skipped:
+                self.retention = status
+
+    def close(self):
+        self.maintenance_stop.set()
+        if self.maintenance_thread is not None:
+            self.maintenance_thread.join(timeout=RECEIVER_TIMEOUT + 5)
+            if self.maintenance_thread.is_alive():
+                return  # Process exit releases it; never close a DB still in use.
+        if self.jobs.acquire(timeout=RECEIVER_TIMEOUT + 5):
+            try:
+                self.journal.close()
+            finally:
+                self.jobs.release()
+
+    def request(self, op, thread=None, **fields):
+        request = {'version': 1, 'op': op, 'socket': SOCKET, **fields}
+        if op not in ('catalog', 'presence'):
+            request['thread'] = thread or THREAD
+        return self.receiver(request)
+
+    def target(self, thread=THREAD):
+        reply = self.request('target', thread=thread)
+        target = reply.get('target')
+        if (reply.get('ok') is not True or not isinstance(target, dict) or
+                any(k not in target for k in PUBLIC_TARGET) or
+                target.get('thread') != thread or target.get('socket') != SOCKET or
+                not isinstance(reply.get('target_token'), str) or
+                not 1 <= len(reply['target_token']) <= 4096):
+            fail('target_unavailable', 'Exact Codex draft is unavailable; check the terminal', 409)
+        return reply
+
+    def catalog(self):
+        reply = self.request('catalog')
+        if (reply.get('ok') is not True or reply.get('tmux_ok') is not True or
+                not isinstance(reply.get('chats'), list) or
+                not isinstance(reply.get('threads'), list)):
+            fail('catalog', 'Could not safely list the home Codex chats', 503)
+        return reply
+
+    def presence(self):
+        reply = self.request('presence')
+        if (reply.get('ok') is not True or not isinstance(reply.get('threads'), list)):
+            fail('presence', 'Could not safely inspect native process presence', 503)
+        return reply
+
+    @staticmethod
+    def clear_target(session):
+        session.update(target=None, target_id=None, confirmed=False, ticket=None)
+
+    def check_target(self, session):
+        previous = session.get('target')
+        if not previous or not session.get('confirmed'):
+            fail('target_confirmation', 'Use this chat must be confirmed first', 409)
+        live = self.target(session['thread'])
+        if (any(previous['target'][k] != live['target'][k] for k in IDENTITY) or
+                previous['target_token'] != live['target_token'] or live.get('composer') != 'ready'):
+            self.clear_target(session)
+            fail('target_changed', 'The draft changed or is busy; inspect and confirm it again', 409)
+        return live
+
+    def session(self, nonce):
+        with self.sessions_lock:
+            value = self.sessions.get(nonce)
+            if value is None or value['expires'] <= self.clock():
+                self.sessions.pop(nonce, None)
+                fail('session', 'Page session expired; reconnect and inspect recent receipts', 403)
+            return value
+
+    def new_session(self):
+        with self.sessions_lock:
+            self.sessions = {k: v for k, v in self.sessions.items() if v['expires'] > self.clock()}
+            if len(self.sessions) >= MAX_SESSIONS:
+                fail('sessions', 'Too many active pages; try again after a session expires', 503)
+            nonce = secrets.token_urlsafe(32)
+            self.sessions[nonce] = {'expires': self.clock() + SESSION_TTL,
+                                    'thread': THREAD, 'target': None, 'target_id': None,
+                                    'confirmed': False, 'selections': {}, 'ticket': None}
+            return {'ok': True, 'nonce': nonce, 'thread': THREAD, 'protocol': 2,
+                    'ttl_seconds': SESSION_TTL, 'retention_days': 7,
+                    'limits': {'max_files': MAX_FILES, 'max_image': MAX_IMAGE, 'max_batch': MAX_BATCH}}
+
+    def stored_upload(self, found, images, session):
+        fingerprint, receipt = found
+        target = receipt.get('target')
+        if fingerprint.startswith('v2:'):
+            if not target:
+                fail('receipt', 'Stored operation has no target identity', 503)
+            selected = session.get('target')
+            if selected and any(selected['target'][k] != target[k] for k in IDENTITY):
+                fail('operation_conflict', 'Operation belongs to a different exact draft', 409)
+            current = validate_images(images, target)
+        else:
+            if session['thread'] != THREAD:
+                fail('operation_conflict', 'Legacy operation belongs to the default chat', 409)
+            current = validate_images(images)
+        if current != fingerprint:
+            fail('operation_conflict', 'Operation ID belongs to different screenshots', 409)
+        return {'ok': True, 'operation': receipt}
+
+    def api(self, method, path, body, nonce):
+        if path == '/api/session' and method == 'POST':
+            exact_keys(body, ())
+            return self.new_session()
+        session = self.session(nonce)
+        if method == 'GET' and path == '/api/chats':
+            catalog = self.catalog()
+            chats, selections = [], {}
+            for entry in catalog['chats'][:64]:
+                target = entry.get('target', {}) if isinstance(entry, dict) else {}
+                thread = target.get('thread')
+                try:
+                    valid = (isinstance(thread, str) and str(uuid.UUID(thread)) == thread and
+                             target.get('socket') == SOCKET and
+                             all(key in target for key in PUBLIC_TARGET))
+                except ValueError:
+                    valid = False
+                if not valid:
+                    continue
+                selection = secrets.token_urlsafe(24)
+                selections[selection] = {key: target[key] for key in PUBLIC_TARGET}
+                chats.append({'selection_id': selection, 'target': selections[selection],
+                              'composer': entry.get('composer', 'not ready'), 'is_default': thread == THREAD})
+            with self.sessions_lock:
+                self.session(nonce)['selections'] = selections
+            return {'ok': True, 'chats': chats,
+                    'truncated': catalog.get('truncated') is True or catalog.get('complete') is not True}
+        if method == 'GET' and path == '/api/receipts':
+            with self.journal.lock:
+                self.retention['managed'] = self.journal.db.execute(
+                    "SELECT count(*) FROM managed_files WHERE state<>'deleted'").fetchone()[0]
+            return {'ok': True, 'operations': self.journal.recent(),
+                    'unresolved': self.journal.unresolved(), 'unresolved_capacity': MAX_UNRESOLVED,
+                    'retention': dict(self.retention)}
+        if method == 'GET' and path.startswith('/api/receipt/'):
+            ident = operation_id(path.removeprefix('/api/receipt/'))
+            found = self.journal.get(ident)
+            if found is None:
+                fail('receipt_missing', 'No reserved operation found; inspect the draft before retrying', 404)
+            return {'ok': True, 'operation': found[1], 'resolution': self.journal.resolution(ident)}
+        if method != 'POST' or path not in (
+                '/api/target', '/api/confirm', '/api/operations', '/api/upload', '/api/resolve'):
+            fail('route', 'Unknown endpoint or method', 404)
+        if path in ('/api/upload', '/api/operations') and body.get('protocol') != 2:
+            fail('protocol_reload', 'Reload this page to use the updated screenshot service', 409)
+        if path == '/api/target':
+            if body not in ({},) and set(body) != {'selection_id'}:
+                fail('fields', 'Choose a server-listed chat')
+        else:
+            exact_keys(body, {'/api/confirm': ('target_id',), '/api/operations': ('protocol',),
+                              '/api/upload': ('protocol', 'operation_id', 'images'),
+                              '/api/resolve': ('operation_id',)}[path])
+        if path == '/api/upload':
+            ident = operation_id(body['operation_id'])
+            found = self.journal.get(ident)
+            if found:
+                return self.stored_upload(found, body['images'], session)
+            ticket = session.get('ticket')
+            if not ticket or ticket['id'] != ident or ticket['expires'] <= self.clock():
+                fail('operation_unknown', 'No current operation is available; inspect the actual draft', 410)
+        if not self.jobs.acquire(blocking=False):
+            fail('busy', 'An upload or screenshot cleanup is running; try again shortly', 409)
+        try:
+            session = self.session(nonce)  # Repeat after body read / lock admission.
+            if path == '/api/resolve':
+                return {'ok': True, 'resolution': self.journal.acknowledge(operation_id(body['operation_id']))}
+            if path == '/api/target':
+                with self.sessions_lock:
+                    wanted = session['selections'].get(body.get('selection_id')) if body else None
+                    self.clear_target(session)
+                if body and wanted is None:
+                    fail('selection', 'Refresh the chat list and choose a listed chat', 409)
+                if wanted is None:
+                    catalog = self.catalog()
+                    wanted = next((entry['target'] for entry in catalog['chats']
+                                   if entry.get('target', {}).get('thread') == THREAD), None)
+                    if wanted is None:
+                        fail('no_default', 'The default chat is unavailable; choose a listed chat', 409)
+                live = self.target(wanted['thread'])
+                if any(live['target'].get(key) != wanted.get(key) for key in PUBLIC_TARGET):
+                    fail('target_changed', 'This chat changed; refresh the chat list', 409)
+                with self.sessions_lock:
+                    self.session(nonce).update(thread=wanted['thread'], target=live,
+                                               target_id=secrets.token_urlsafe(24))
+                return {'ok': True, 'target_id': session['target_id'],
+                        'target': {key: live['target'][key] for key in PUBLIC_TARGET},
+                        'composer': live.get('composer', 'not ready'), 'is_default': wanted['thread'] == THREAD}
+            with self.sessions_lock:
+                previous = session['target']
+                if path == '/api/confirm' and (not previous or not isinstance(body['target_id'], str) or
+                                              body['target_id'] != session['target_id']):
+                    fail('target_confirmation', 'Inspect this chat again before confirming', 409)
+                if path in ('/api/upload', '/api/operations') and not session['confirmed']:
+                    fail('target_confirmation', 'Use this chat must be confirmed first', 409)
+            live = self.target(session['thread'])
+            if (not previous or any(previous['target'][k] != live['target'][k] for k in IDENTITY)
+                    or previous['target_token'] != live['target_token'] or live.get('composer') != 'ready'):
+                with self.sessions_lock:
+                    self.clear_target(session)
+                fail('target_changed', 'The draft changed or is busy; inspect and confirm it again', 409)
+            session = self.session(nonce)  # Discovery may have consumed the remaining TTL.
+            if path == '/api/confirm':
+                with self.sessions_lock:
+                    session['confirmed'] = True
+                return {'ok': True, 'confirmed': True, 'target': {k: live['target'][k] for k in PUBLIC_TARGET}}
+            if path == '/api/operations':
+                if self.journal.unresolved() >= MAX_UNRESOLVED:
+                    fail('journal_full', 'Check unresolved uploads before preparing another', 503)
+                ident = self.journal.issue_id()
+                session = self.session(nonce)
+                expires = min(session['expires'], self.clock() + TICKET_TTL)
+                with self.sessions_lock:
+                    session['ticket'] = {'id': ident, 'target_id': session['target_id'],
+                                         'target': dict(live['target']), 'expires': expires}
+                return {'ok': True, 'operation_id': ident, 'expires_in': max(0, expires - self.clock())}
+            found = self.journal.get(ident)
+            if found:
+                return self.stored_upload(found, body['images'], session)
+            ticket = session.get('ticket')
+            if (not ticket or ticket['id'] != ident or ticket['expires'] <= self.clock() or
+                    ticket['target_id'] != session['target_id'] or
+                    any(ticket['target'][key] != live['target'][key] for key in IDENTITY)):
+                fail('operation_unknown', 'No current operation is available; inspect the actual draft', 410)
+            fingerprint = validate_images(body['images'], live['target'])
+            self.session(nonce)
+            if ticket['expires'] <= self.clock():
+                fail('operation_unknown', 'Operation ticket expired; inspect the actual draft', 410)
+            receipt = self.journal.reserve(ident, fingerprint, live['target'])
+            with self.sessions_lock:
+                session['ticket'] = None
+            try:
+                result = self.request('upload', thread=session['thread'], target_token=live['target_token'],
+                                      images=body['images'], attach=True)
+                if result.get('ok') is True:
+                    receipt.update(state='completed', result=result)
+                self.journal.finish(ident, receipt)
+            except Exception:
+                # Durable reserved receipt remains uncertain, even if completion persistence failed.
+                receipt = self.journal.get(ident)[1]
+            return {'ok': True, 'operation': receipt}
+        finally:
+            self.jobs.release()
+
+
+def one_header(headers, name, required=True):
+    values = headers.get_all(name, [])
+    if len(values) > 1 or (required and len(values) != 1):
+        fail('headers', 'Missing or duplicate request header', 400)
+    return values[0] if values else None
+
+
+def dispatch(app, method, path, headers, stream, peer, set_timeout=lambda _: None):
+    """Memory-testable HTTP boundary; it never creates a socket or receiver by itself."""
+    if peer != '127.0.0.1':
+        fail('peer', 'Loopback proxy required', 403)
+    if one_header(headers, 'Host') != app.host or one_header(headers, 'Tailscale-User-Login') != app.login:
+        fail('identity', 'Authorized Tailscale identity and canonical host required', 403)
+    if '?' in path or '#' in path or method not in ('GET', 'POST'):
+        fail('request', 'Unsupported request', 405)
+    if one_header(headers, 'Transfer-Encoding', False) is not None or one_header(
+            headers, 'Content-Encoding', False) is not None:
+        fail('encoding', 'Transfer and content encoding are refused')
+    length = one_header(headers, 'Content-Length', False)
+    if method == 'GET':
+        if length not in (None, '0'):
+            fail('body', 'GET body is refused')
+        if path == '/':
+            if app.page is None:
+                fail('page', 'Frontend is not installed', 503)
+            return app.page
+        nonce = one_header(headers, 'X-Codex-Drop-Nonce')
+        return canonical(app.api(method, path, None, nonce))
+    if one_header(headers, 'Origin') != app.origin:
+        fail('origin', 'Exact HTTPS origin required', 403)
+    if one_header(headers, 'Content-Type') != 'application/json':
+        fail('content_type', 'Use application/json', 415)
+    nonce = None if path == '/api/session' else one_header(headers, 'X-Codex-Drop-Nonce')
+    if path != '/api/session':
+        app.session(nonce)  # Reject before reading a potentially large body.
+    if length is None or not re.fullmatch(r'[0-9]{1,9}', length) or not 1 <= int(length) <= MAX_BODY:
+        fail('body_size', 'Request exceeds the bounded JSON upload size', 413)
+    chunks, left, deadline = [], int(length), time.monotonic() + BODY_TIMEOUT
+    try:
+        while left:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail('read_timeout', 'Upload body timed out', 408)
+            set_timeout(min(remaining, 10))
+            chunk = stream.read(min(left, 65536))
+            if not chunk:
+                fail('body', 'Upload body was interrupted')
+            chunks.append(chunk)
+            left -= len(chunk)
+    except (TimeoutError, OSError):
+        fail('read_timeout', 'Upload body timed out or was interrupted', 408)
+    return canonical(app.api(method, path, decode_json(b''.join(chunks)), nonce))
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.0'
+
+    def setup(self):
+        self.request.settimeout(10)
+        super().setup()
+
+    def log_message(self, *_):
+        pass  # No operator identities, filenames, nonces or request URLs in logs.
+
+    def send_error(self, code, message=None, explain=None):
+        self.respond(code, canonical(error('request', 'Unsupported or malformed HTTP request')))
+
+    def respond(self, status_code, data, html=False):
+        self.close_connection = True
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'text/html; charset=utf-8' if html else 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Connection', 'close')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+        self.send_header('Content-Security-Policy', self.server.page_csp)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_request(self):
+        try:
+            data = dispatch(self.server.app, self.command, self.path, self.headers,
+                            self.rfile, self.client_address[0], self.connection.settimeout)
+            self.respond(200, data, self.command == 'GET' and self.path == '/')
+        except Refusal as refusal:
+            self.respond(refusal.status, canonical(error(refusal.code, refusal.message)))
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnect cannot replay or cancel a reserved operation.
+        except Exception:
+            with contextlib.suppress(OSError):
+                self.respond(503, canonical(error('uncertain', 'Inspect receipts and the Codex draft')))
+
+    do_GET = do_POST = do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = handle_request
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = False
+    allow_reuse_address = False
+
+    def __init__(self, app):
+        self.app, self.page_csp = app, csp(app.page or b'')
+        self.slots = threading.BoundedSemaphore(2)
+        super().__init__(('127.0.0.1', 8766), Handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def load_config(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096):
+            fail('config', 'Config must be a private 0600 file owned by this user')
+        raw = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    config = decode_json(raw)
+    exact_keys(config, ('canonical_host', 'allowed_login'))
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--check-ancestors', action='store_true')
+    args = parser.parse_args()
+    os.umask(0o077)
+    try:
+        if args.check_ancestors:
+            check_ancestors(state_path(), config_path=args.config)
+            return
+        # Let systemd's ordinary stop run the same bounded worker/journal
+        # shutdown as Ctrl+C. The read-only pre-start path above stays inert.
+        def stop(*_):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop)
+        config = load_config(args.config)
+        page = (Path.home() / '.local/share/codex-drop-web/index.html').read_bytes()
+        if len(page) > 512 * 1024:
+            fail('page', 'Frontend exceeds its source limit')
+        app = App(config['canonical_host'], config['allowed_login'],
+                  state_path(), page=page)
+        try:
+            with Server(app) as server:
+                app.start_maintenance()
+                server.serve_forever(poll_interval=0.5)
+        finally:
+            app.close()
+    except (Refusal, OSError, sqlite3.Error):
+        parser.exit(1, 'codex-drop-web: startup refused; check private config/state and approved install packet\n')
+
+
+if __name__ == '__main__':
+    main()

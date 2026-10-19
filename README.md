@@ -69,6 +69,13 @@ aliases and strict host-key checks. [Terminal-drop background](docs/screenshots-
 describes a separate wrapper from the parent Byobu tools; that wrapper and its
 tests are not shipped here.
 
+For Codex and Claude image workflows, see the separate offline
+[agent handoff guide](docs/agent-workflows.md) and
+[shared source skill](skills/screenshot-drop-agent/SKILL.md). The new CLI imports,
+verifies, pairs and copies existing images or prepares private transfer bundles.
+Agent capture, installed skill discovery and actual model image reads remain
+separate acceptance steps; this source addition does not deploy them.
+
 ## Retention and trust
 
 Managed web screenshots become eligible for cleanup after **7 days**, measured
@@ -93,7 +100,7 @@ Use Python 3 and Node.js already installed on your Linux development machine:
 python3 -I -B tests/run_offline.py
 ```
 
-In plain English: this runs both suites with synthetic images and mocked chats,
+In plain English: this runs the offline suites with synthetic images and mocked chats,
 and disables the optional SSH, Windows and native-Codex integration flags. It
 creates temporary test files and child processes, without using your live chat,
 browser, credentials or model account. Node is required for the frontend checks.

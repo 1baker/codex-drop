@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Offline image handoffs for cooperating, same-UID Codex/Claude tasks."""
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import stat
+import sys
+
+MAX_REQUEST = 256 * 1024
+MAX_IMAGE = 25 * 1024 * 1024
+MAX_BATCH = 50 * 1024 * 1024
+MAX_BUNDLE = 72 * 1024 * 1024
+MAX_ARTIFACTS = 1000
+MAX_BYTES = 2 * 1024 * 1024 * 1024
+MAX_OPERATIONS = 10000
+MAX_ROOTS = 8
+MAX_CONSUMERS = 4
+ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
+SHA_RE = re.compile(r'[a-f0-9]{64}\Z')
+PURPOSES = ('iteration', 'proposal', 'imagegen-feedback', 'repo-asset')
+KINDS = ('codex', 'claude')
+VERDICTS = ('pass', 'fail', 'needs_change', 'note')
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+RETENTION = {
+    'managed_web_days': 7, 'part_of_web_cleanup': False,
+    'automatic_cleanup': False, 'deletes_artifacts_or_exports': False,
+    'on_full': 'quota_exhausted',
+    'reclaim': 'User may remove a whole task store manually outside this tool.',
+}
+
+
+class AgentError(Exception):
+    def __init__(self, code, message):
+        self.code, self.message = code, message
+        super().__init__(message)
+
+
+def require(ok, code='malformed', message='Invalid request.'):
+    if not ok:
+        raise AgentError(code, message)
+
+
+def fields(value, required, optional=()):
+    require(type(value) is dict and set(required) <= value.keys()
+            and value.keys() <= set(required) | set(optional))
+    return value
+
+
+def text(value, limit, allow_empty=False):
+    require(type(value) is str)
+    try:
+        require((allow_empty or bool(value)) and len(value.encode('utf-8')) <= limit
+                and '\x00' not in value)
+    except UnicodeError:
+        raise AgentError('malformed', 'Invalid text encoding.') from None
+    return value
+
+
+def ident(value):
+    require(type(value) is str and ID_RE.fullmatch(value) is not None)
+    return value
+
+
+def sha(value):
+    require(type(value) is str and SHA_RE.fullmatch(value) is not None)
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=True,
+                      separators=(',', ':'), allow_nan=False).encode('ascii')
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def parse_json(data):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, 'malformed', 'Duplicate JSON field.')
+            result[key] = value
+        return result
+    def constant(_):
+        raise AgentError('malformed', 'Non-finite JSON value.')
+    try:
+        return json.loads(data.decode('utf-8'), object_pairs_hook=pairs,
+                          parse_constant=constant)
+    except (ValueError, UnicodeError, RecursionError):
+        raise AgentError('malformed', 'Invalid JSON.') from None
+
+
+def absolute(value):
+    text(value, 4096)
+    require(value.startswith('/') and value != '/' and '\\' not in value
+            and all(ord(c) >= 32 and ord(c) != 127 for c in value),
+            'unsafe_path', 'An explicit absolute directory is required.')
+    parts = value[1:].split('/')
+    require(len(parts) <= 128 and all(p not in ('', '.', '..') for p in parts),
+            'unsafe_path', 'Noncanonical directory path.')
+    return parts
+
+
+def relative(value):
+    try:
+        text(value, 512)
+    except AgentError:
+        raise AgentError('unsafe_path', 'Invalid relative path.') from None
+    parts = value.split('/')
+    require(len(parts) <= 16 and all(p not in ('', '.', '..') for p in parts)
+            and '\\' not in value and not value.startswith('/')
+            and all(ord(c) >= 32 and ord(c) != 127 for c in value),
+            'unsafe_path', 'Invalid relative path.')
+    return parts
+
+
+def dir_identity(info):
+    return [info.st_dev, info.st_ino]
+
+
+def stable_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_uid, info.st_nlink, info.st_mode)
+
+
+def trusted_directory(info, final=False):
+    mode = stat.S_IMODE(info.st_mode)
+    if final:
+        require(info.st_uid == os.geteuid() and mode == 0o700,
+                'store_unsafe', 'Task store must be owned by this user and mode 0700.')
+    else:
+        sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+        require(info.st_uid in (0, os.geteuid()) and
+                (not mode & 0o022 or sticky_root),
+                'store_unsafe', 'Untrusted or writable store ancestor.')
+
+
+def open_directory(path, private=False, create=False):
+    parts = absolute(path)
+    fd = os.open('/', DIR_FLAGS)
+    try:
+        if private:
+            trusted_directory(os.fstat(fd))
+        for i, part in enumerate(parts):
+            final = i == len(parts) - 1
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                require(create and final, 'missing_directory', 'Directory does not exist.')
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            if private:
+                try:
+                    trusted_directory(os.fstat(child), final)
+                except BaseException:
+                    os.close(child)
+                    raise
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def check_private(info):
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600,
+            'store_unsafe', 'Private metadata has unsafe type, owner, links or mode.')
+
+
+def private_fd(parent, name, create=False):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    fd = os.open(name, flags, 0o600, dir_fd=parent)
+    try:
+        check_private(os.fstat(fd))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def bounded_fd(fd, limit, private=False):
+    before = os.fstat(fd)
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+            and before.st_nlink == 1, 'unsafe_file',
+            'Expected a current-user, single-link regular file.')
+    if private:
+        check_private(before)
+    require(0 < before.st_size <= limit, 'too_large', 'File is empty or exceeds its limit.')
+    chunks, total = [], 0
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        require(total <= limit, 'too_large', 'File grew beyond its limit.')
+    require(stable_identity(before) == stable_identity(os.fstat(fd))
+            and total == before.st_size, 'source_changed', 'File changed while reading.')
+    return b''.join(chunks)
+
+
+def read_private(parent, name, limit):
+    fd = private_fd(parent, name)
+    try:
+        return bounded_fd(fd, limit, private=True)
+    finally:
+        os.close(fd)
+
+
+def write_file(parent, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                 | os.O_CLOEXEC, 0o600, dir_fd=parent)
+    try:
+        check_private(os.fstat(fd))
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            require(written > 0, 'write_failed', 'Short file write.')
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(parent)
+
+
+def image_kind(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    raise AgentError('not_image', 'Expected PNG, JPEG, GIF or WebP signature.')
+
+
+def consumer(value):
+    fields(value, ('kind', 'id'))
+    require(value['kind'] in KINDS)
+    ident(value['id'])
+    return value
+
+
+def snapshot_roots(values, exports=False):
+    require(type(values) is dict and len(values) <= MAX_ROOTS)
+    result = {}
+    for name, item in values.items():
+        ident(name)
+        fields(item, ('path', 'purpose') if exports else ('path',))
+        if exports:
+            require(item['purpose'] in PURPOSES)
+        fd = open_directory(item['path'])
+        try:
+            result[name] = dict(item, identity=dir_identity(os.fstat(fd)))
+        finally:
+            os.close(fd)
+    return result
+
+
+def make_context(request):
+    p = fields(request['payload'], ('consumers', 'sources', 'exports'))
+    require(type(p['consumers']) is list and 1 <= len(p['consumers']) <= MAX_CONSUMERS)
+    consumers = [consumer(c) for c in p['consumers']]
+    require(len({canonical(c) for c in consumers}) == len(consumers)
+            and request['consumer'] in consumers)
+    return dict(schema=1, task_id=request['task_id'], owner_id=request['owner_id'],
+                consumers=consumers, sources=snapshot_roots(p['sources']),
+                exports=snapshot_roots(p['exports'], True))
+
+
+@contextlib.contextmanager
+def rooted(context, group, name, path):
+    ident(name)
+    require(name in context[group], 'unknown_root', 'Root is not registered in this task.')
+    root = context[group][name]
+    parts = relative(path)
+    root_fd = open_directory(root['path'])
+    parent = os.dup(root_fd)
+    chain = []
+    try:
+        require(dir_identity(os.fstat(root_fd)) == root['identity'],
+                'root_changed', 'Registered directory identity changed.')
+        for part in parts[:-1]:
+            child = os.open(part, DIR_FLAGS, dir_fd=parent)
+            chain.append((os.dup(parent), part, dir_identity(os.fstat(child))))
+            os.close(parent)
+            parent = child
+        yield parent, parts[-1], os.path.join(root['path'], *parts)
+        # Success requires the named path still to resolve to the pinned objects.
+        again = open_directory(root['path'])
+        try:
+            require(dir_identity(os.fstat(again)) == root['identity'],
+                    'root_changed', 'Registered directory changed during operation.')
+        finally:
+            os.close(again)
+        for ancestor, component, identity in chain:
+            info = os.stat(component, dir_fd=ancestor, follow_symlinks=False)
+            require(stat.S_ISDIR(info.st_mode) and dir_identity(info) == identity,
+                    'root_changed', 'Destination parent changed during operation.')
+    finally:
+        for ancestor, _, _ in chain:
+            os.close(ancestor)
+        os.close(parent)
+        os.close(root_fd)
+
+
+def read_source(context, source, limit):
+    fields(source, ('root', 'path', 'sha256'))
+    expected = sha(source['sha256'])
+    with rooted(context, 'sources', source['root'], source['path']) as (parent, name, _):
+        fd = os.open(name, FILE_FLAGS, dir_fd=parent)
+        try:
+            data = bounded_fd(fd, limit)
+        finally:
+            os.close(fd)
+    require(digest(data) == expected, 'hash_mismatch', 'Source digest differs from request.')
+    return data
+
+
+def connect_db(parent):
+    # Supply the checked directory path. Do not assume SQLite retains dirfd semantics;
+    # metadata safety relies on private ancestors, file checks and cooperating users.
+    for name in ('ledger.sqlite', 'ledger.sqlite-journal'):
+        try:
+            fd = private_fd(parent, name)
+        except FileNotFoundError:
+            require(name.endswith('-journal'), 'store_incomplete', 'Ledger is missing.')
+        else:
+            os.close(fd)
+    db = sqlite3.connect(f'/proc/self/fd/{parent}/ledger.sqlite', timeout=30)
+    try:
+        db.execute('PRAGMA journal_mode=DELETE')
+        db.execute('PRAGMA synchronous=FULL')
+        return db
+    except BaseException:
+        db.close()
+        raise
+
+
+def bootstrap(parent, context):
+    require(set(os.listdir(parent)) == {'.lock'}, 'store_incomplete',
+            'Partial bootstrap or unexpected store files; nothing was repaired.')
+    fd = private_fd(parent, 'ledger.sqlite', create=True)
+    os.close(fd)
+    db = connect_db(parent)
+    try:
+        db.execute('CREATE TABLE operations(op_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,'
+                   ' state TEXT NOT NULL, result_json TEXT NOT NULL)')
+        db.execute('CREATE TABLE artifacts(id TEXT PRIMARY KEY, op_id TEXT NOT NULL,'
+                   ' sha256 TEXT NOT NULL, size INTEGER NOT NULL, kind TEXT NOT NULL,'
+                   ' name TEXT NOT NULL)')
+        data = canonical(context)
+        write_file(parent, 'context.tmp', data)
+        os.rename('context.tmp', 'context.json', src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+        db.execute('INSERT INTO operations VALUES(?,?,?,?)',
+                   ('@context', digest(data), 'context', data.decode('ascii')))
+        db.commit()
+    finally:
+        db.close()
+
+
+def load_context(parent, db):
+    require('context.tmp' not in os.listdir(parent), 'store_incomplete',
+            'Partial context write; nothing was repaired.')
+    try:
+        data = read_private(parent, 'context.json', MAX_REQUEST)
+        row = db.execute('SELECT fingerprint,result_json FROM operations WHERE op_id=?',
+                         ('@context',)).fetchone()
+    except (FileNotFoundError, sqlite3.DatabaseError):
+        raise AgentError('store_incomplete', 'Incomplete store metadata.') from None
+    require(row is not None and digest(data) == row[0] and data.decode('ascii') == row[1],
+            'store_incomplete', 'Context is missing or differs from its ledger binding.')
+    return parse_json(data)
+
+
+def outcome(request, **extra):
+    return dict(schema=1, ok=True, state='complete', operation=request['operation'],
+                operation_id=request.get('operation_id'), task_id=request['task_id'],
+                owner_id=request['owner_id'], consumer=request['consumer'],
+                stages=dict(local_import='not_performed', staging='not_performed',
+                            inspection='not_performed', delivery='not_performed',
+                            native_attachment='not_performed', model_consumption='not_observed',
+                            provider_submission='not_performed', public_publication='not_performed',
+                            training='not_performed'), retention=RETENTION, **extra)
+
+
+def artifact(db, parent, store, artifact_id, limit=MAX_IMAGE):
+    ident(artifact_id)
+    row = db.execute('SELECT a.sha256,a.size,a.kind,a.name,o.state FROM artifacts a'
+                     ' JOIN operations o ON a.op_id=o.op_id WHERE a.id=?',
+                     (artifact_id,)).fetchone()
+    require(row is not None and row[4] == 'complete', 'unknown_artifact',
+            'No completed artifact with that ID.')
+    data = read_private(parent, row[3], limit)
+    require(len(data) == row[1] and digest(data) == row[0] and image_kind(data) == row[2],
+            'readback_mismatch', 'Artifact bytes differ from their recorded digest.')
+    return dict(id=artifact_id, sha256=row[0], size=row[1], kind=row[2],
+                path=os.path.join(store, row[3])), data
+
+
+def artifacts_list(value):
+    require(type(value) is list and 1 <= len(value) <= 10
+            and len(set(ident(x) for x in value)) == len(value))
+    return value
+
+
+def output_spec(context, value, purpose=None):
+    fields(value, ('root', 'path'))
+    ident(value['root'])
+    relative(value['path'])
+    require(value['root'] in context['exports'], 'unknown_root', 'Export root is unregistered.')
+    root = context['exports'][value['root']]
+    require(purpose is None or root['purpose'] == purpose, 'wrong_purpose',
+            'Destination purpose does not match the registered root.')
+    with rooted(context, 'exports', value['root'], value['path']) as (fd, name, _):
+        try:
+            os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AgentError('destination_exists', 'Destination already exists; no overwrite.')
+    return value
+
+
+def bundle_bytes(items, request):
+    return canonical(dict(schema=1, sender=dict(task_id=request['task_id'],
+                          owner_id=request['owner_id'], consumer=request['consumer']),
+                          images=[dict(index=i, source_id=meta['id'], sha256=meta['sha256'],
+                                       size=meta['size'], kind=meta['kind'],
+                                       data=base64.b64encode(data).decode('ascii'))
+                                  for i, (meta, data) in enumerate(items)]))
+
+
+def unpack_bytes(data):
+    envelope = fields(parse_json(data), ('schema', 'sender', 'images'))
+    require(type(envelope['schema']) is int and envelope['schema'] == 1)
+    sender = fields(envelope['sender'], ('task_id', 'owner_id', 'consumer'))
+    ident(sender['task_id']); ident(sender['owner_id']); consumer(sender['consumer'])
+    images = envelope['images']
+    require(type(images) is list and 1 <= len(images) <= 10)
+    result, total, ids = [], 0, set()
+    for i, item in enumerate(images):
+        fields(item, ('index', 'source_id', 'sha256', 'size', 'kind', 'data'))
+        require(type(item['index']) is int and item['index'] == i)
+        source_id = ident(item['source_id'])
+        require(source_id not in ids)
+        ids.add(source_id)
+        size = item['size']
+        require(type(size) is int and 0 < size <= MAX_IMAGE, 'too_large', 'Invalid image size.')
+        total += size
+        require(total <= MAX_BATCH, 'too_large', 'Bundle exceeds decoded batch limit.')
+        sha(item['sha256'])
+        require(item['kind'] in ('png', 'jpg', 'gif', 'webp') and type(item['data']) is str
+                and len(item['data']) == 4 * ((size + 2) // 3))
+        try:
+            raw = base64.b64decode(item['data'].encode('ascii'), validate=True)
+        except (ValueError, UnicodeError):
+            raise AgentError('malformed', 'Invalid bundle encoding.') from None
+        require(len(raw) == size and digest(raw) == item['sha256'],
+                'hash_mismatch', 'Bundle image digest or size differs.')
+        require(image_kind(raw) == item['kind'], 'not_image', 'Bundle signature differs.')
+        result.append(raw)
+    return result, sender
+
+
+def prepare(request, context, db, parent, store):
+    p, op = request['payload'], request['operation']
+    result = outcome(request)
+    images, effect = [], None
+    if op == 'init':
+        require(make_context(request) == context, 'context_mismatch',
+                'Existing task context cannot be changed.')
+        result['initialized'] = True
+    elif op == 'ingest':
+        fields(p, ('files',))
+        require(type(p['files']) is list and 1 <= len(p['files']) <= 10)
+        total = 0
+        for source in p['files']:
+            raw = read_source(context, source, min(MAX_IMAGE, MAX_BATCH - total))
+            image_kind(raw)
+            images.append(raw)
+            total += len(raw)
+    elif op == 'unpack':
+        fields(p, ('source',))
+        images, sender = unpack_bytes(read_source(context, p['source'], MAX_BUNDLE))
+        result['sender_assertion'] = sender
+        result['sender_identity_verified'] = False
+    elif op == 'inspect':
+        fields(p, ('artifact_id',))
+        meta, _ = artifact(db, parent, store, p['artifact_id'])
+        result['artifact'] = meta
+        result['validation'] = 'bytes_sha256_and_signature_only'
+        result['stages']['inspection'] = 'performed'
+    elif op == 'pair':
+        fields(p, ('before', 'after', 'before_revision', 'after_revision', 'criteria'))
+        before, _ = artifact(db, parent, store, p['before'])
+        after, _ = artifact(db, parent, store, p['after'])
+        require(before['id'] != after['id'])
+        text(p['before_revision'], 128); text(p['after_revision'], 128); text(p['criteria'], 4096)
+        result['pair'] = dict(before=before, after=after, before_revision=p['before_revision'],
+                              after_revision=p['after_revision'], criteria=p['criteria'],
+                              bytes_equal=before['sha256'] == after['sha256'])
+        result['stages']['inspection'] = 'performed'
+    elif op == 'feedback':
+        fields(p, ('subject', 'verdict', 'finding'), ('spec_sha256',))
+        subject = fields(p['subject'], (), ('artifact_id', 'pair_operation_id'))
+        require(len(subject) == 1 and p['verdict'] in VERDICTS)
+        text(p['finding'], 8192)
+        if 'spec_sha256' in p:
+            sha(p['spec_sha256'])
+        if 'artifact_id' in subject:
+            bound, _ = artifact(db, parent, store, subject['artifact_id'])
+        else:
+            ident(subject['pair_operation_id'])
+            row = db.execute('SELECT state,result_json FROM operations WHERE op_id=?',
+                             (subject['pair_operation_id'],)).fetchone()
+            require(row is not None and row[0] == 'complete', 'unknown_pair', 'Pair is incomplete.')
+            prior = parse_json(row[1].encode('ascii'))
+            require(prior['operation'] == 'pair', 'unknown_pair', 'Operation is not a pair.')
+            bound = prior['pair']
+            artifact(db, parent, store, bound['before']['id'])
+            artifact(db, parent, store, bound['after']['id'])
+        result['feedback'] = dict(p, bound=bound, assertion='agent_attested_not_verified_vision')
+        result['stages']['staging'] = 'performed'
+        result['stages']['inspection'] = 'not_observed'
+    elif op == 'promote':
+        fields(p, ('artifact_id', 'destination', 'purpose'))
+        require(p['purpose'] in PURPOSES)
+        meta, raw = artifact(db, parent, store, p['artifact_id'])
+        destination = output_spec(context, p['destination'], p['purpose'])
+        suffix = destination['path'].rsplit('.', 1)[-1].lower()
+        require(suffix in (('jpg', 'jpeg') if meta['kind'] == 'jpg' else (meta['kind'],)),
+                'wrong_extension', 'Destination extension differs from image signature.')
+        effect = (destination, raw)
+        result.update(artifact=meta, purpose=p['purpose'], destination=destination)
+    elif op == 'pack':
+        fields(p, ('artifact_ids', 'destination'))
+        items, total = [], 0
+        for a in artifacts_list(p['artifact_ids']):
+            meta, raw = artifact(db, parent, store, a, min(MAX_IMAGE, MAX_BATCH - total))
+            total += meta['size']
+            items.append((meta, raw))
+        destination = output_spec(context, p['destination'])
+        require(destination['path'].endswith('.json'), 'wrong_extension', 'Bundle needs .json suffix.')
+        raw = bundle_bytes(items, request)
+        require(len(raw) <= MAX_BUNDLE, 'too_large', 'Encoded bundle exceeds limit.')
+        effect = (destination, raw)
+        result.update(artifact_ids=p['artifact_ids'], destination=destination,
+                      bundle=dict(size=len(raw), sha256=digest(raw)))
+    else:
+        raise AgentError('unknown_operation', 'Unsupported operation.')
+    return result, images, effect
+
+
+def reserve(db, request, fingerprint, result, images, effect):
+    count = db.execute("SELECT count(*) FROM operations WHERE state != 'context'").fetchone()[0]
+    n, used = db.execute('SELECT count(*),coalesce(sum(size),0) FROM artifacts').fetchone()
+    require(count < MAX_OPERATIONS and n + len(images) <= MAX_ARTIFACTS
+            and used + sum(map(len, images)) <= MAX_BYTES,
+            'quota_exhausted', 'Store cap reached; no automatic deletion or ID recycling.')
+    allocations = []
+    for i, raw in enumerate(images, n + 1):
+        a_id, kind = f'a{i:06d}', image_kind(raw)
+        allocations.append(dict(id=a_id, sha256=digest(raw), size=len(raw), kind=kind,
+                                name=f'{a_id}.{kind}'))
+    pending = dict(result, ok=False, state='uncertain', artifacts=allocations,
+                   error=dict(code='uncertain', message='Reserved; effects may be incomplete.'))
+    pending['stages'] = dict(result['stages'])
+    if images:
+        pending['stages'].update(local_import='not_observed', staging='not_observed',
+                                 inspection='not_observed')
+        if request['operation'] == 'unpack':
+            pending['stages']['delivery'] = 'not_observed'
+    if effect is not None:
+        pending['reserved_destination'] = effect[0]
+        pending['stages'].update(staging='not_observed', inspection='not_observed')
+        if request['operation'] == 'promote':
+            pending['stages']['delivery'] = 'not_observed'
+    with db:
+        db.execute('INSERT INTO operations VALUES(?,?,?,?)',
+                   (request['operation_id'], fingerprint, 'uncertain', canonical(pending).decode('ascii')))
+        for a in allocations:
+            db.execute('INSERT INTO artifacts VALUES(?,?,?,?,?,?)',
+                       (a['id'], request['operation_id'], a['sha256'], a['size'], a['kind'], a['name']))
+    return allocations, pending
+
+
+def finish(db, op_id, result):
+    with db:
+        changed = db.execute("UPDATE operations SET state='complete',result_json=?"
+                             " WHERE op_id=? AND state='uncertain'",
+                             (canonical(result).decode('ascii'), op_id)).rowcount
+        require(changed == 1, 'ledger_conflict', 'Operation cannot change terminal state.')
+
+
+def verify_export(context, destination, expected_size, expected_sha):
+    with rooted(context, 'exports', destination['root'], destination['path']) as (fd, name, path):
+        source = os.open(name, FILE_FLAGS, dir_fd=fd)
+        try:
+            raw = bounded_fd(source, expected_size)
+        finally:
+            os.close(source)
+    require(len(raw) == expected_size and digest(raw) == expected_sha,
+            'readback_mismatch', 'Destination readback differs from receipt.')
+    return path
+
+
+def execute(request, context, db, parent, store):
+    op = request['operation']
+    fingerprint = digest(canonical({k: v for k, v in request.items() if k != 'operation_id'}))
+    if op != 'inspect':
+        op_id = request['operation_id']
+        prior = db.execute('SELECT fingerprint,state,result_json FROM operations WHERE op_id=?',
+                           (op_id,)).fetchone()
+        if prior:
+            require(prior[0] == fingerprint, 'operation_conflict', 'Operation ID has different input.')
+            result = parse_json(prior[2].encode('ascii'))
+            if prior[1] == 'complete' and op in ('promote', 'pack'):
+                meta = result['artifact'] if op == 'promote' else result['bundle']
+                verify_export(context, result['destination'], meta['size'], meta['sha256'])
+            return result
+        require(db.execute("SELECT 1 FROM operations WHERE fingerprint=? AND state='uncertain'",
+                           (fingerprint,)).fetchone() is None, 'uncertain_previous',
+                'Equivalent operation remains uncertain; a new ID cannot redispatch it.')
+    result, images, effect = prepare(request, context, db, parent, store)
+    if op == 'inspect':
+        return result
+    allocations, pending = reserve(db, request, fingerprint, result, images, effect)
+    # No image/project/bundle bytes may be written above this durable boundary.
+    try:
+        if images:
+            saved = []
+            for a, raw in zip(allocations, images):
+                write_file(parent, a['name'], raw)
+                measured = read_private(parent, a['name'], MAX_IMAGE)
+                require(measured == raw, 'readback_mismatch', 'Stored image differs.')
+                saved.append({k: v for k, v in a.items() if k != 'name'} |
+                             {'path': os.path.join(store, a['name'])})
+            result['artifacts'] = saved
+            result['stages'].update(local_import='performed', staging='performed', inspection='performed')
+            if op == 'unpack':
+                result['stages']['delivery'] = 'performed'
+                result['delivery_scope'] = 'destination_local_store_from_bundle_not_network'
+        if effect is not None:
+            destination, raw = effect
+            with rooted(context, 'exports', destination['root'], destination['path']) as (fd, name, _):
+                write_file(fd, name, raw)
+            result['destination_path'] = verify_export(context, destination, len(raw), digest(raw))
+            result['stages'].update(staging='performed', inspection='performed')
+            if op == 'promote':
+                result['stages']['delivery'] = 'performed'
+                result['delivery_scope'] = 'destination_local_project_copy_not_publication'
+        finish(db, request['operation_id'], result)
+        return result
+    except Exception:
+        # The FULL-committed original reservation remains immutable and uncertain.
+        # Keep this copy even if the ledger itself is no longer readable.
+        return pending
+
+
+def validate_request(request):
+    fields(request, ('schema', 'task_id', 'owner_id', 'consumer', 'operation', 'payload'),
+           ('operation_id',))
+    require(type(request['schema']) is int and request['schema'] == 1)
+    ident(request['task_id']); ident(request['owner_id']); consumer(request['consumer'])
+    require(type(request['operation']) is str and request['operation'] in
+            ('init', 'ingest', 'inspect', 'pair', 'promote', 'feedback', 'pack', 'unpack'),
+            'unknown_operation', 'Unsupported operation.')
+    require(type(request['payload']) is dict)
+    if request['operation'] == 'inspect':
+        require('operation_id' not in request)
+    else:
+        require('operation_id' in request)
+        ident(request['operation_id'])
+    return request
+
+
+@contextlib.contextmanager
+def store_session(store, initial_context=None):
+    parent = open_directory(store, private=True, create=initial_context is not None)
+    lock, db, created_lock = None, None, False
+    try:
+        try:
+            lock = private_fd(parent, '.lock')
+        except FileNotFoundError:
+            require(initial_context is not None and not os.listdir(parent),
+                    'store_incomplete', 'Store has no lock; nothing was repaired.')
+            try:
+                lock = private_fd(parent, '.lock', create=True)
+                created_lock = True
+                os.fsync(parent)
+            except FileExistsError:
+                lock = private_fd(parent, '.lock')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # A renamed/replaced final store must not be used under its old pathname.
+        again = open_directory(store, private=True)
+        try:
+            require(dir_identity(os.fstat(again)) == dir_identity(os.fstat(parent)),
+                    'store_unsafe', 'Store directory identity changed.')
+        finally:
+            os.close(again)
+        if initial_context is not None and set(os.listdir(parent)) == {'.lock'}:
+            require(created_lock, 'store_incomplete', 'Leftover bootstrap lock; nothing was repaired.')
+            bootstrap(parent, initial_context)
+        db = connect_db(parent)
+        context = load_context(parent, db)
+        yield parent, db, context
+    finally:
+        if db is not None:
+            db.close()
+        if lock is not None:
+            os.close(lock)
+        os.close(parent)
+
+
+def run_request(store, request):
+    validate_request(request)
+    initial = make_context(request) if request['operation'] == 'init' else None
+    with store_session(store, initial) as (parent, db, context):
+        require(request['task_id'] == context['task_id'] and request['owner_id'] == context['owner_id']
+                and request['consumer'] in context['consumers'],
+                'context_mismatch', 'Task, owner or consumer differs from immutable context.')
+        return execute(request, context, db, parent, store)
+
+
+def read_request(path):
+    if path == '-':
+        raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
+    else:
+        fd = os.open(path, FILE_FLAGS)
+        try:
+            raw = bounded_fd(fd, MAX_REQUEST)
+        finally:
+            os.close(fd)
+    require(0 < len(raw) <= MAX_REQUEST, 'too_large', 'Request exceeds 256 KiB or is empty.')
+    return parse_json(raw)
+
+
+def main(argv=None):
+    def argument_error(_):
+        raise AgentError('malformed', 'Invalid command or arguments.')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('doctor', 'run', 'receipt'))
+    parser.add_argument('--store')
+    parser.add_argument('--request-file')
+    parser.add_argument('--task')
+    parser.add_argument('--operation')
+    parser.error = argument_error
+    os.umask(0o077)
+    try:
+        args = parser.parse_args(argv)
+        if args.command == 'doctor':
+            require(not any((args.store, args.request_file, args.task, args.operation)))
+            result = dict(schema=1, ok=True, mode='offline_files_only', capture='not_delivered',
+                          guide_path=os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                                  'docs', 'agent-workflows.md'),
+                          consumer_kinds=list(KINDS), retention=RETENTION,
+                          store_requirement='Linux/WSL POSIX ownership and modes; use XDG_STATE_HOME or ~/.local/state.',
+                          drvfs_identity_qualified=False, full_image_decode=False,
+                          authentication='cooperating_same_uid_context_not_security_authentication',
+                          limits=dict(request=MAX_REQUEST, image=MAX_IMAGE, batch=MAX_BATCH,
+                                      bundle=MAX_BUNDLE, artifacts=MAX_ARTIFACTS, stored_bytes=MAX_BYTES,
+                                      operations=MAX_OPERATIONS))
+        elif args.command == 'run':
+            require(args.store is not None and args.request_file is not None
+                    and args.task is None and args.operation is None)
+            result = run_request(args.store, read_request(args.request_file))
+        else:
+            require(args.store is not None and args.task is not None and args.operation is not None
+                    and args.request_file is None)
+            ident(args.task); ident(args.operation)
+            with store_session(args.store) as (_, db, context):
+                require(args.task == context['task_id'], 'context_mismatch', 'Wrong receipt task.')
+                row = db.execute("SELECT result_json FROM operations WHERE op_id=? AND state!='context'",
+                                 (args.operation,)).fetchone()
+                require(row is not None, 'unknown_operation', 'No receipt for that operation.')
+                result = parse_json(row[0].encode('ascii'))
+        print(canonical(result).decode('ascii'))
+        return 0 if result.get('ok') else 3
+    except (AgentError, OSError, sqlite3.Error) as exc:
+        code = exc.code if isinstance(exc, AgentError) else 'io_refusal'
+        message = exc.message if isinstance(exc, AgentError) else 'Filesystem or ledger refused the operation.'
+        print(canonical(dict(schema=1, ok=False, state='refused', error=dict(code=code, message=message),
+                             retention=RETENTION)).decode('ascii'))
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

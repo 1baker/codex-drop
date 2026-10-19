@@ -14,7 +14,7 @@ def main():
     for key in ('CODEX_DROP_SSH', 'CODEX_DROP_PS', 'CODEX_DROP_NATIVE',
                 'CODEX_SSH_INTEGRATION', 'CODEX_SSH_NATIVE'):
         env.pop(key, None)
-    for name in ('test_codex_drop.py', 'test_codex_drop_web.py'):
+    for name in ('test_codex_drop.py', 'test_codex_drop_web.py', 'test_codex_drop_agent.py'):
         result = subprocess.run([sys.executable, '-I', '-B', str(root / 'tests' / name)],
                                 cwd=root, env=env, check=False)
         if result.returncode:

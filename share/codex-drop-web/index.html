@@ -34,7 +34,7 @@ section.card { background: var(--card); border: 1px solid var(--line); border-ra
 section.card h2 { margin: 0 0 8px; font-size: 1.1rem; }
 .strip-top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; justify-content: space-between; }
 .state { font-weight: 600; margin: 0; flex: 1 1 260px; }
-.badge { font-size: .8rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; white-space: nowrap; }
+.badge { font-size: .8rem; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; white-space: normal; overflow-wrap: anywhere; max-width: 100%; }
 .badge.warn { color: var(--warn); border-color: var(--warn); }
 .message { margin: 6px 0 0; }
 .error { margin: 6px 0 0; color: var(--bad); font-weight: 600; white-space: pre-wrap; }
@@ -200,7 +200,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
   // Upload refusals the API contract defines as happening before any receiver
   // dispatch. Everything else keeps the operation ID as an open uncertainty.
   var DEFINITE_REFUSALS = { protocol_reload: true, session: true, busy: true, target_changed: true };
-  var TRANSIENT_ERRORS = { network: true, session: true, session_failed: true, chats_failed: true, receipts_failed: true, not_connected: true };
+  var TRANSIENT_ERRORS = { network: true, session: true, session_failed: true, chats_failed: true, receipts_failed: true, not_connected: true, readiness_failed: true };
 
   // ---- Pure helpers -------------------------------------------------------
 
@@ -548,6 +548,48 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     var tickHandle = null;
     var disposed = false;
     var lastResume = -Infinity;
+    var activeResume = null;
+    var intentGeneration = 0;
+
+    function cancelFreshIntent() {
+      intentGeneration++;
+      if (activeResume && activeResume.intent) s.armed = false;
+    }
+
+    function queuedMessage() {
+      var count = s.queue.length + (s.queue.length === 1 ? ' screenshot' : ' screenshots');
+      if (hasPendingUncertainty(s)) return count + ' queued. ' + RECOVERY_HINT;
+      return s.confirmed
+        ? count + ' queued. Tap Attach selected.'
+        : count + " selected. Choose 'Use this chat', then tap Attach selected.";
+    }
+
+    function canContinueDrop(context) {
+      var intent = context.intent;
+      return !!(context.ok && context.eligible && intent && !context.claimed &&
+        context.generation === intentGeneration && !disposed && !s.reloadRequired &&
+        !s.busy && !s.working && s.connected && s.confirmed && s.targetId &&
+        !hasPendingUncertainty(s) && sameTarget(s.target, context.target) &&
+        sameTarget(s.confirmedTarget, context.target) && s.queueRev === intent.rev &&
+        s.queue.length === intent.entries.length &&
+        s.queue.every(function (entry, i) { return entry === intent.entries[i]; }));
+    }
+
+    function continueFreshDrop(context) {
+      if (!context.drain) context.drain = context.done.then(function () {
+        // This continuation belongs to the fresh gesture, not to resume.
+        // Check and enter send synchronously, before another gesture can run.
+        if (canContinueDrop(context)) {
+          context.claimed = true;
+          return send();
+        }
+        s.armed = false;
+        if (!disposed && s.queue.length) s.message = queuedMessage();
+        update();
+        return false;
+      });
+      return context.drain;
+    }
 
     function scheduleTick() {
       if (!timers) return;
@@ -761,6 +803,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     }
 
     async function connect() {
+      cancelFreshIntent();
       if (s.busy || s.working || s.reloadRequired || disposed) return false;
       s.working = true;
       s.error = null;
@@ -778,36 +821,59 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
       }
     }
 
-    // Read-only readiness refresh for focus/pageshow/visibility/online. It
-    // never prepares, reserves or uploads anything, even with a queue.
+    // Read-only refresh. Only a new file gesture can register a continuation;
+    // focus, renewal and resume alone never prepare, reserve or upload files.
     async function resume() {
       if (disposed || s.busy || s.working || s.reloadRequired) return false;
       var t = now();
       if (t - lastResume < RESUME_MIN_MS) return false;
       lastResume = t;
+      var context = {
+        generation: intentGeneration, target: s.confirmedTarget,
+        eligible: !!(s.confirmed && s.armed && !s.queue.length &&
+          !hasPendingUncertainty(s) && sameTarget(s.target, s.confirmedTarget)),
+        intent: null, claimed: false, ok: false, drain: null
+      };
+      context.done = new Promise(function (resolve) { context.finish = resolve; });
+      activeResume = context;
       s.working = true;
       update();
       try {
         if (!s.connected || sessionExpired()) {
-          var ok = (await renewSession(s.target)) && s.connected;
-          if (ok) clearTransientError();
-          return ok;
+          context.ok = !!((await renewSession(s.target)) && s.connected);
+          if (context.ok) clearTransientError();
+          return context.ok;
         }
         if (!(await readReceipts(true))) return false;
-        if (await readChats(true)) reconcileChats();
-        if (s.operationId && !s.receiptInspected) await lookupReceipt(s.operationId);
+        if (!(await readChats(true))) return false;
+        reconcileChats();
+        if (s.operationId && !s.receiptInspected &&
+            (await lookupReceipt(s.operationId)) === 'error') return false;
         clearTransientError();
+        context.ok = true;
         return true;
       } catch (err) {
         setError('network', 'Could not reach Codex Drop: ' + errText(err) + '. Nothing was sent.');
         return false;
       } finally {
+        if (!context.ok) {
+          s.connected = false;
+          s.nonce = null;
+          s.sessionDeadline = 0;
+          s.targetId = null;
+          unconfirm();
+          s.confirmedTarget = null;
+          if (!s.reloadRequired) setError('readiness_failed', "Couldn't check the home computer. Tap Reconnect, then confirm the chat again. Nothing was sent.");
+        }
         s.working = false;
+        if (activeResume === context) activeResume = null;
         update();
+        context.finish({ ok: context.ok });
       }
     }
 
     async function refreshTarget() {
+      cancelFreshIntent();
       if (s.busy || s.working || !s.nonce) return false;
       s.working = true;
       s.error = null;
@@ -832,6 +898,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     }
 
     async function selectChat(index) {
+      cancelFreshIntent();
       if (s.busy || s.working || !s.nonce) return false;
       var entry = s.chats[index];
       if (!entry) return false;
@@ -861,6 +928,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     }
 
     async function confirmChat() {
+      cancelFreshIntent();
       if (s.busy || s.working || !s.nonce || !s.targetId) return false;
       var wanted = s.target;
       s.working = true;
@@ -874,9 +942,9 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
         }
         if (s.confirmed) return true;
         if (!(await doConfirm())) return false;
-        s.message = s.armed
-          ? 'Using this chat. Dropped, pasted or chosen screenshots attach automatically.'
-          : 'Using this chat. ' + RECOVERY_HINT;
+        s.message = hasPendingUncertainty(s) ? 'Using this chat. ' + RECOVERY_HINT
+          : (s.queue.length ? queuedMessage()
+            : 'Using this chat. Dropped, pasted or chosen screenshots attach automatically.');
         return true;
       } catch (err) {
         unconfirm();
@@ -889,6 +957,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     }
 
     async function addFiles(files) {
+      if (disposed) return false;
       if (s.busy) {
         setError('busy', 'An upload is in progress. Wait for it to finish before adding screenshots.');
         update();
@@ -902,13 +971,30 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
         update();
         return false;
       }
-      list.forEach(function (f) {
-        s.queue.push({ file: f, name: fileName(f) || 'screenshot', size: f.size, type: fileType(f), url: preview(f) });
+      var context = activeResume;
+      var deferFresh = !!(context && context.eligible && !context.claimed &&
+        context.generation === intentGeneration && !hasPendingUncertainty(s) &&
+        (context.intent ? s.queue.length === context.intent.entries.length &&
+          s.queue.every(function (entry, i) { return entry === context.intent.entries[i]; }) : !s.queue.length));
+      var entries = list.map(function (f) {
+        return { file: f, name: fileName(f) || 'screenshot', size: f.size, type: fileType(f), url: preview(f) };
       });
+      Array.prototype.push.apply(s.queue, entries);
       s.queueRev++;
       s.error = null;
       if (mayAutoUpload(s) && !s.working && s.connected && !hasPendingUncertainty(s)) return send();
-      if (s.confirmed && s.armed && s.working) s.message = 'Added. Tap "Attach selected" to upload.';
+      // A queued batch is manual unless this exact fresh gesture owns a
+      // continuation of the same readiness refresh from an empty armed queue.
+      s.armed = false;
+      if (deferFresh) {
+        if (!context.intent) context.intent = { entries: [], rev: null };
+        Array.prototype.push.apply(context.intent.entries, entries);
+        context.intent.rev = s.queueRev;
+        s.message = s.queue.length + (s.queue.length === 1 ? ' screenshot will' : ' screenshots will') + ' attach when the check finishes.';
+        update();
+        return continueFreshDrop(context);
+      }
+      s.message = queuedMessage();
       update();
       return true;
     }
@@ -1206,6 +1292,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     function remove(index) {
       if (s.busy) return false;
       if (typeof index !== 'number' || index < 0 || index >= s.queue.length) return false;
+      cancelFreshIntent();
       var it = s.queue.splice(index, 1)[0];
       revoke(it && it.url);
       s.queueRev++;
@@ -1215,6 +1302,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
 
     function clear() {
       if (s.busy) return false;
+      cancelFreshIntent();
       revokeAll();
       s.queue = [];
       s.queueRev++;
@@ -1223,6 +1311,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     }
 
     function dispose() {
+      cancelFreshIntent();
       disposed = true;
       if (timers && tickHandle !== null) timers.clearTimeout(tickHandle);
       tickHandle = null;
@@ -1358,10 +1447,12 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
     };
 
     var renderedQueue = null;
+    var queueButtons = [];
     var renderQueue = function (s) {
       var key = s.queueRev + ':' + s.busy;
       if (renderedQueue === key) return;
       renderedQueue = key;
+      queueButtons = [];
       var frag = document.createDocumentFragment();
       s.queue.forEach(function (it, i) {
         var li = el('li');
@@ -1377,7 +1468,13 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
         b.type = 'button';
         b.disabled = s.busy;
         b.setAttribute('aria-label', 'Remove ' + it.name);
-        b.addEventListener('click', function () { controller.remove(i); });
+        b.addEventListener('click', function () {
+          if (controller.remove(i)) {
+            var next = queueButtons[Math.min(i, queueButtons.length - 1)] || ui.choose;
+            if (typeof next.focus === 'function') next.focus();
+          }
+        });
+        queueButtons.push(b);
         li.appendChild(b);
         frag.appendChild(li);
       });
@@ -1486,7 +1583,8 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
       renderSession(s);
 
       ui.connectRow.hidden = s.connected && !!s.nonce;
-      ui.connect.textContent = s.reloadRequired ? 'Reload required' : (s.nonce ? 'Reconnect' : 'Connect');
+      ui.connect.textContent = s.reloadRequired ? 'Reload required'
+        : (s.nonce || (s.error && s.error.code === 'readiness_failed') ? 'Reconnect' : 'Connect');
       ui.connect.disabled = s.busy || s.working || s.reloadRequired;
       renderChats(s);
       ui.useChat.disabled = !s.targetId || s.busy || s.working || s.confirmed;
@@ -1500,7 +1598,7 @@ footer { color: var(--muted); font-size: .85rem; text-align: center; }
       ui.zone.classList.toggle('disabled', s.busy);
       ui.zone.setAttribute('aria-busy', s.busy ? 'true' : 'false');
       renderQueue(s);
-      ui.attach.disabled = s.busy || s.working || !s.confirmed || !s.queue.length || pending || s.reloadRequired;
+      ui.attach.disabled = s.busy || s.working || !s.connected || !s.confirmed || !s.queue.length || pending || s.reloadRequired;
       ui.clear.disabled = s.busy || !s.queue.length;
 
       renderRecovery(s, pending);

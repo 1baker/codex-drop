@@ -86,6 +86,26 @@ events refresh readiness without an upload. Renewal preserves confirmation only
 when every public target field still matches the chat the user confirmed. A
 changed or closed chat requires another explicit confirmation.
 
+A fresh drop, paste or picker selection made during that readiness check keeps
+its own single-use upload intent if the check began with an empty queue and an
+already confirmed, armed chat. After the same check succeeds for the exact same
+chat, those new files upload once without an Attach click. Multiple selections
+during that one check join one bounded batch. The refresh itself never uploads;
+without a fresh gesture it only checks readiness. A later drop cannot authorize
+older queued or failed files. Removing/clearing files, changing selection,
+reconnecting, disposing the page, a failed check or a changed target cancels the
+intent. Files that remain queued require explicit **Attach selected**.
+
+Files added before first confirming a chat are announced with their count and
+the next steps: **Use this chat**, then **Attach selected**. This is an ordinary
+queued batch, not an uncertain upload or a recovery acknowledgement. If a
+readiness check fails, the page leaves Ready, displays Reconnect, disables Attach
+and requires fresh explicit chat confirmation after reconnecting. Queue removal
+restores keyboard focus to a remaining Remove button or the chooser, and the
+session badge can wrap. These behaviors have offline controller/DOM fixtures;
+rendered phone layout and real keyboard/screen-reader acceptance remain unverified.
+
+
 State lives under `~/.local/state/codex-drop-web` (0700), with private 0600 files,
 one instance lock and an 8 MiB SQLite page quota. All unresolved operations are
 retained and displayed; admission stops at 64 unresolved uploads. Existing

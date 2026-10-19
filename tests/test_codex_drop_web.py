@@ -703,6 +703,7 @@ class Element {
  appendChild(n){if(n.tag==='#fragment')this.children.push(...n.children);else this.children.push(n);return n;}
  replaceChildren(...ns){this.children=[];this._text='';ns.forEach(n=>this.appendChild(n));}
  setAttribute(k,v){this[k]=v;}
+ focus(){document.activeElement=this;}
  addEventListener(k,v){(this.events[k]||=([])).push(v);}
  fire(k,e={}){for(const cb of this.events[k]||[])cb(e);}
  click(){this.clicks++;if(!this.disabled)this.fire('click');}
@@ -712,13 +713,13 @@ const document={getElementById(id){if(!nodes.has(id))nodes.set(id,new Element(id
  createElement:tag=>new Element(tag),createDocumentFragment:()=>new Element('#fragment'),
  addEventListener(k,cb){(docEvents[k]||=([])).push(cb);}};
 const id=n=>document.getElementById(n);const calls=[],uploads=[],receipts=new Map(),revoked=[];
-let lose=false,ticketCount=0;
+let lose=false,ticketCount=0,failRead=false,failSession=false,protocol=2;
 const target={thread:'home',session:'fixture',window_name:'test'};
 const fakeFetch=async(path,init)=>{
- calls.push(path);assert.equal(init.credentials,'omit');assert.equal(init.mode,'same-origin');
+ calls.push(path);if(failSession&&path==='/api/session')throw Error('Fixture session failure');if(failRead&&path==='/api/receipts')return{ok:false,status:503,text:async()=>JSON.stringify({ok:false,error:{code:'receipts_failed',message:'Fixture refusal'}})};assert.equal(init.credentials,'omit');assert.equal(init.mode,'same-origin');
  assert.equal(init.referrerPolicy,'same-origin');assert.equal(init.redirect,'error');
  const body=init.body?JSON.parse(init.body):null;let data;
- if(path==='/api/session')data={ok:true,nonce:'memory-only',protocol:2,ttl_seconds:900,retention_days:7,thread:'home',limits:{max_files:10,max_image:26214400,max_batch:52428800}};
+ if(path==='/api/session')data={ok:true,nonce:'memory-only',protocol,ttl_seconds:900,retention_days:7,thread:'home',limits:{max_files:10,max_image:26214400,max_batch:52428800}};
  else{
   assert.equal(init.headers['X-Codex-Drop-Nonce'],'memory-only');
   if(path==='/api/receipts')data={ok:true,operations:Array.from(receipts.values())};
@@ -756,7 +757,13 @@ const drop=files=>{let prevented=false;const e={dataTransfer:{types:['Files'],fi
  docEvents.drop.forEach(cb=>cb(e));assert.equal(prevented,true);};
 (async()=>{
  vm.runInContext(pageScript,context);
- await until(()=>!id('use-chat').disabled);id('use-chat').click();await until(()=>id('state').textContent.startsWith('Ready'));
+ await until(()=>!id('use-chat').disabled);
+ drop([file('focus-one.png'),file('focus-two.png')]);await until(()=>id('queue').children.length===2);
+ const removeButton=i=>id('queue').children[i].children.find(n=>n.tag==='button');
+ removeButton(0).focus();removeButton(0).click();
+ assert.equal(document.activeElement,removeButton(0),'Remove should move focus to the next remaining file');
+ removeButton(0).click();assert.equal(document.activeElement,id('choose'),'An empty queue returns focus to the chooser');
+ assert.equal(uploads.length,0);id('use-chat').click();await until(()=>id('state').textContent.startsWith('Ready'));
  id('choose').click();assert.equal(id('picker').clicks,1);
  id('picker').files=[file('picker.png')];id('picker').fire('change');
  await until(()=>uploads.length===1&&id('queue').children.length===0);
@@ -772,6 +779,22 @@ const drop=files=>{let prevented=false;const e={dataTransfer:{types:['Files'],fi
  await until(()=>id('message').textContent.includes('Marked as checked'));
  lose=false;id('attach').click();await until(()=>uploads.length===3&&id('queue').children.length===0);
  assert.notEqual(uploads[1].operation_id,uploads[2].operation_id);assert.ok(revoked.length>=3);
+ failRead=true;context.testNow=Date.now()+10000;
+ vm.runInContext('Date.now=function(){return testNow;};',context);winEvents.focus();
+ await until(()=>id('state').textContent.startsWith('Not connected'));
+ assert.equal(id('connect-row').hidden,false);assert.equal(id('attach').disabled,true);
+ assert.equal(id('use-chat').disabled,true);assert.equal(id('refresh-target').disabled,true);
+ assert.equal(id('chat-select').disabled,true);assert.equal(id('connect').textContent,'Reconnect');
+ assert.match(id('message').textContent+' '+id('error').textContent,/reconnect|couldn't check/i);
+ failRead=false;context.testNow+=10000;winEvents.focus();
+ await until(()=>id('state').textContent.startsWith('Check the chat'));
+ assert.equal(id('error').textContent,'','A successful later readiness check clears its earlier failure');
+ failSession=true;context.testNow+=901000;winEvents.focus();
+ await until(()=>id('state').textContent.startsWith('Not connected'));
+ assert.equal(id('connect').textContent,'Reconnect','A failed renewal must offer the action named in its error');
+ failSession=false;protocol=1;context.testNow+=10000;winEvents.focus();
+ await until(()=>id('state').textContent.includes('out of date'));
+ assert.equal(id('connect').disabled,true);assert.match(id('error').textContent,/out of date.*reload/i);
  assert.deepEqual(errors,[]);console.log('actual DOM picker/drop/recovery PASS');
 })().catch(e=>{console.error(e);process.exitCode=1});
 ''', dom=True)
@@ -1240,6 +1263,192 @@ const c=h.createController({api,now:()=>now,prepare:async files=>{if(failPrepare
  assert.equal(calls.filter(x=>x==='/api/upload').length,1);c.dispose();
 })().catch(e=>{console.error(e);process.exitCode=1});
 ''')
+
+
+class FreshDropFrontendTests(unittest.TestCase):
+    setUp = FrontendTests.setUp
+    run_node = FrontendTests.run_node
+
+    def run_case(self, case):
+        self.run_node(r'''
+const h=globalThis.CodexDropTest;
+const file=name=>({name,type:'image/png',size:12});
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+const until=async p=>{for(let i=0;i<100&&!p();i++)await tick();assert.ok(p(),'fixture did not reach held read');};
+function fixture(){
+ let now=100000,gate=null,seq=0,session=0,changed=false,readFailure=null,prepareFailure=false,preparationGate=null,receipts=[],protocol=2;
+ const calls=[],prepared=[],uploads=[];
+ const target={thread:'home',socket:'default',pane:'%1',pane_pid:'2',window:'@1',tui_pid:'3',tui_start:'4',session:'test',window_name:'test'};
+ const current=()=>({...target,tui_pid:changed?'other':'3'});
+ const api=async(method,path,body)=>{
+  calls.push(path);
+  if(gate&&gate.path===path&&!gate.entered){gate.entered=true;await gate.promise;}
+  if(readFailure===path)return{ok:false,error:{code:'read_failed',message:'Fixture refusal'}};
+  if(path==='/api/session')return{ok:true,nonce:'session-'+(++session),protocol,ttl_seconds:900,retention_days:7};
+  if(path==='/api/receipts')return{ok:true,operations:receipts,unresolved:receipts.length,unresolved_capacity:64};
+  if(path==='/api/chats')return{ok:true,chats:[{selection_id:'opaque',target:current(),composer:'ready',is_default:true}]};
+  if(path==='/api/target')return{ok:true,target_id:'reference',target:current(),composer:'ready'};
+  if(path==='/api/confirm')return{ok:true,confirmed:true,target:current()};
+  if(path==='/api/operations')return{ok:true,operation_id:'11111111-1111-4111-8111-'+String(++seq).padStart(12,'0')};
+  if(path==='/api/upload'){uploads.push(body);return{ok:true,operation:{operation_id:body.operation_id,state:'completed',result:{ok:true,attach:{state:'verified'},files:body.images.map(x=>({name:x.name,attach:'attached-verified'}))}}};}
+  throw Error('Unexpected endpoint '+path);
+ };
+ const c=h.createController({api,now:()=>now,preview:()=>null,prepare:async files=>{
+  prepared.push(files.map(x=>x.name));if(prepareFailure)throw Error('Fixture file read failure');
+  if(preparationGate){preparationGate.entered=true;await preparationGate.promise;}
+  return files.map(x=>({name:x.name,size:x.size,sha256:'a'.repeat(64),data:'fixture'}));
+ }});
+ return{c,calls,prepared,uploads,expire(){now+=901000;},change(){changed=true;},
+  failure(path){readFailure=path;},prepareFailure(v){prepareFailure=v;},protocol(v){protocol=v;},
+  incident(){receipts=[{operation_id:'11111111-1111-4111-8111-999999999999',state:'uncertain',result:{ok:false,error:{code:'outcome_uncertain'}}}];},
+  holdPreparation(){let resolve;const promise=new Promise(r=>resolve=r);preparationGate={promise,resolve,entered:false};return preparationGate;},
+  hold(path){let resolve;const promise=new Promise(r=>resolve=r);gate={path,promise,resolve,entered:false};return gate;}};
+}
+(async()=>{
+''' + case + r'''
+})().catch(e=>{console.error(e);process.exitCode=1});
+''')
+
+    def test_fresh_drop_survives_same_readiness_check_once(self):
+        self.run_case(r'''
+for(const renewal of [false,true]){
+ const f=fixture();await f.c.connect();await f.c.confirmChat();if(renewal)f.expire();
+ const gate=f.hold(renewal?'/api/session':'/api/receipts');const refresh=f.c.resume();await until(()=>gate.entered);
+ const drop=f.c.addFiles([file('fresh.png')]);await tick();assert.equal(f.uploads.length,0);
+ assert.match(f.c.state.message,/1.*(?:will attach|check finishes|checking)/i);
+ gate.resolve();await Promise.all([refresh,drop]);
+ assert.equal(f.uploads.length,1,'Fresh gesture must finish without an Attach click');
+ assert.deepEqual(f.prepared,[['fresh.png']]);assert.equal(f.calls.filter(x=>x==='/api/operations').length,1);
+ assert.deepEqual(f.uploads[0].images.map(x=>x.name),['fresh.png']);f.c.dispose();
+}
+''')
+
+    def test_multiple_fresh_drops_merge_into_one_bounded_upload(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();const gate=f.hold('/api/chats');
+const refresh=f.c.resume();await until(()=>gate.entered);
+const a=f.c.addFiles([file('one.png')]),b=f.c.addFiles([file('two.png')]);
+assert.equal(await f.c.addFiles(Array(11).fill(file('excess.png'))),false);
+gate.resolve();await Promise.all([refresh,a,b]);
+assert.equal(f.uploads.length,1);assert.deepEqual(f.prepared,[['one.png','two.png']]);
+assert.deepEqual(f.uploads[0].images.map(x=>x.name),['one.png','two.png']);f.c.dispose();
+''')
+
+    def test_readiness_without_gesture_never_prepares_or_uploads(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();await f.c.resume();
+assert.equal(f.prepared.length,0);assert.equal(f.uploads.length,0);
+assert.equal(f.calls.filter(x=>x==='/api/operations').length,0);f.c.dispose();
+''')
+
+    def test_failed_reads_cancel_fresh_intent_and_offer_reconnect(self):
+        self.run_case(r'''
+for(const path of ['/api/receipts','/api/chats','/api/session']){
+ const f=fixture();await f.c.connect();await f.c.confirmChat();if(path==='/api/session')f.expire();
+ const gate=f.hold(path);const refresh=f.c.resume();await until(()=>gate.entered);
+ const drop=f.c.addFiles([file('fresh.png')]);f.failure(path);gate.resolve();await Promise.all([refresh,drop]);
+ assert.equal(f.uploads.length,0);assert.equal(f.c.state.armed,false);
+ assert.equal(f.c.state.connected,false);assert.equal(f.c.state.confirmed,false);
+ assert.match((f.c.state.message||'')+' '+(f.c.state.error?.message||''),/could(?: not|n't).*check|reconnect/i);
+ await f.c.addFiles([file('later.png')]);assert.equal(f.uploads.length,0);
+ f.failure(null);await f.c.connect();assert.equal(f.c.state.confirmed,false,'Reconnect must require a new explicit confirmation');
+ assert.equal(f.uploads.length,0);f.c.dispose();
+}
+''')
+
+    def test_late_drop_cannot_start_another_upload_after_drain_claim(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();
+const preparing=f.holdPreparation(),gate=f.hold('/api/chats');const refresh=f.c.resume();await until(()=>gate.entered);
+const drop=f.c.addFiles([file('fresh.png')]);gate.resolve();await until(()=>preparing.entered);
+assert.equal(await f.c.addFiles([file('too-late.png')]),false);
+preparing.resolve();await Promise.all([refresh,drop]);assert.equal(f.uploads.length,1);
+assert.deepEqual(f.uploads[0].images.map(x=>x.name),['fresh.png']);f.c.dispose();
+''')
+
+    def test_new_uncertain_receipt_cancels_pending_fresh_upload(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();const gate=f.hold('/api/receipts');
+const refresh=f.c.resume();await until(()=>gate.entered);const drop=f.c.addFiles([file('fresh.png')]);
+f.incident();gate.resolve();await Promise.all([refresh,drop]);
+assert.equal(f.uploads.length,0);assert.equal(f.prepared.length,0);assert.equal(f.c.state.needsAck,true);
+assert.equal(f.c.state.armed,false);f.c.dispose();
+''')
+
+    def test_protocol_refusal_preserves_reload_instruction(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();f.expire();f.protocol(1);
+await f.c.resume();assert.equal(f.c.state.reloadRequired,true);assert.equal(f.c.state.connected,false);
+assert.equal(f.c.state.error.code,'protocol_reload');assert.match(f.c.state.error.message,/out of date.*reload/i);
+assert.equal(f.uploads.length,0);f.c.dispose();
+''')
+
+    def test_successful_automatic_check_clears_readiness_failure(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();f.failure('/api/receipts');await f.c.resume();
+assert.equal(f.c.state.error.code,'readiness_failed');f.failure(null);f.expire();await f.c.resume();
+assert.equal(f.c.state.connected,true);assert.equal(f.c.state.confirmed,false);
+assert.equal(f.c.state.error,null);assert.equal(f.uploads.length,0);f.c.dispose();
+''')
+
+    def test_failed_check_invalidates_session_until_reconnect(self):
+        self.run_case(r'''
+for(const path of ['/api/receipts','/api/chats']){
+ const f=fixture();await f.c.connect();await f.c.confirmChat();f.failure(path);await f.c.resume();
+ const confirmations=f.calls.filter(x=>x==='/api/confirm').length;
+ assert.equal(await f.c.confirmChat(),false);assert.equal(f.c.state.confirmed,false);
+ assert.equal(f.calls.filter(x=>x==='/api/confirm').length,confirmations);
+ assert.equal(f.c.state.error.code,'readiness_failed');
+ assert.equal(await f.c.refreshTarget(),false);assert.equal(await f.c.selectChat(0),false);
+ assert.equal(f.uploads.length,0);f.c.dispose();
+}
+''')
+
+    def test_changed_target_or_user_cancellation_never_uploads(self):
+        self.run_case(r'''
+for(const action of ['change','remove','clear','select','dispose']){
+ const f=fixture();await f.c.connect();await f.c.confirmChat();const gate=f.hold('/api/chats');
+ const refresh=f.c.resume();await until(()=>gate.entered);const drop=f.c.addFiles([file('fresh.png')]);
+ if(action==='change')f.change();else if(action==='remove')f.c.remove(0);
+ else if(action==='clear')f.c.clear();else if(action==='select')await f.c.selectChat(0);else f.c.dispose();
+ gate.resolve();await Promise.all([refresh,drop]);assert.equal(f.uploads.length,0,action);
+ assert.equal(f.c.state.armed,false,action+' must consume automatic intent');f.c.dispose();
+}
+''')
+
+    def test_old_failed_queue_and_unconfirmed_snapshot_never_auto_upload(self):
+        self.run_case(r'''
+for(const prior of ['failed','unconfirmed']){
+ const f=fixture();await f.c.connect();
+ if(prior==='failed'){await f.c.confirmChat();f.prepareFailure(true);await f.c.addFiles([file('old.png')]);f.prepareFailure(false);}
+ const gate=f.hold('/api/chats');const refresh=f.c.resume();await until(()=>gate.entered);
+ const drop=f.c.addFiles([file('new.png')]);gate.resolve();await Promise.all([refresh,drop]);
+ assert.equal(f.uploads.length,0);assert.equal(f.c.state.armed,false);f.c.dispose();
+}
+''')
+
+    def test_manual_queue_is_not_uploaded_by_a_later_drop(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.confirmChat();const gate=f.hold('/api/chats');
+const refresh=f.c.refreshTarget();await until(()=>gate.entered);await f.c.addFiles([file('manual.png')]);
+assert.equal(f.c.state.armed,false);assert.match(f.c.state.message,/1.*(?:queued|selected).*Attach selected/i);
+gate.resolve();await refresh;await f.c.addFiles([file('later.png')]);
+assert.equal(f.uploads.length,0);assert.equal(f.c.state.queue.length,2);f.c.dispose();
+''')
+
+    def test_first_use_queue_announces_action_without_fake_recovery(self):
+        self.run_case(r'''
+const f=fixture();await f.c.connect();await f.c.addFiles([file('first.png')]);
+assert.match(f.c.state.message,/1.*selected.*Use this chat.*Attach selected/i);
+await f.c.confirmChat();assert.equal(f.c.state.armed,false);assert.equal(f.uploads.length,0);
+assert.match(f.c.state.message,/Attach selected/i);assert.doesNotMatch(f.c.state.message,/mark.*checked|check the Codex draft/i);f.c.dispose();
+''')
+
+    def test_expired_badge_can_wrap(self):
+        page = self.path.read_text()
+        badge = re.search(r'\.badge\s*\{([^}]+)\}', page).group(1)
+        self.assertRegex(badge, r'white-space:\s*normal')
+        self.assertRegex(badge, r'overflow-wrap:\s*anywhere')
 
 
 if __name__ == '__main__':

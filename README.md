@@ -1,5 +1,26 @@
 # Codex Drop
 
+**In one sentence:** Codex Drop is a web page you open on your phone or another computer: drop screenshots on it and they appear attached to your Codex chat at home, ready for you to read over and send yourself.
+
+**Who it is for:** Anyone who uses Codex in a terminal at home and wants to give it screenshots from another device.
+
+![Codex Drop page with a chat selector and a drag-and-drop area for screenshots](docs/images/overview.png)
+
+*Real screenshot of the page (shown here not connected to any computer, so no chat is listed).*
+
+**How it works:**
+
+```mermaid
+flowchart LR
+    Phone[Phone or laptop] -->|drop screenshots| Page[Codex Drop page]
+    Page -->|private Tailscale network| Home[Your home computer]
+    Home --> Draft[Attached to your Codex draft]
+    Draft -->|you press send| Codex[Codex]
+```
+
+---
+
+
 Drag, paste or choose screenshots from a device on your Tailscale network and
 attach them to an existing Codex terminal draft on your home computer. Confirm
 the destination chat first. New screenshots then upload automatically when the

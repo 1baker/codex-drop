@@ -79,6 +79,56 @@ class Calls(Fixture):
         self.assertEqual(self.calls, [])
 
 
+class ReviewFindings(Fixture):
+    """Native review findings on PR2 (Standards/Spec FAIL at dd57b780)."""
+
+    def test_a_child_that_ends_without_a_readable_acknowledgement_is_uncertain_not_refused(self):
+        for stdout in ('', 'Traceback (most recent call last):', '{"ok": tr', '[1, 2]'):
+            self.output = stdout
+            out = json.loads(self.server().call('drop_run', {'store': str(self.root / 't1'),
+                                                            'request': {'operation': 'ingest'}})['content'][0]['text'])
+            self.assertEqual(out['state'], 'uncertain', stdout)
+            self.assertIn('drop_receipt', out['next'])
+        self.assertEqual(len(self.calls), 4)       # one call each; nothing re-run
+
+    def test_genuine_cli_refusals_are_kept_unchanged(self):
+        self.output = '{"ok": false, "state": "refused", "error": {"code": "duplicate_operation"}}'
+        out = json.loads(self.server().call('drop_run', {'store': str(self.root / 't1'),
+                                                        'request': {}})['content'][0]['text'])
+        self.assertEqual((out['state'], out['error']['code']), ('refused', 'duplicate_operation'))
+
+    def run_lines(self, *raw):
+        out = io.StringIO()
+        m.serve(self.server(), io.StringIO(''.join(line + '\n' for line in raw)), out)
+        return [json.loads(l) for l in out.getvalue().splitlines()]
+
+    def test_duplicate_keys_anywhere_are_refused_before_dispatch(self):
+        store = str(self.root / 't1')
+        line = ('{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"drop_run","arguments":'
+                '{"store":"%s","request":{"operation_id":"a","operation_id":"b"}}}}' % store)
+        replies = self.run_lines(line)
+        self.assertEqual(replies[0]['error']['code'], -32700)
+        self.assertEqual(self.calls, [])
+
+    def test_malformed_protocol_fields_get_errors_and_the_session_continues(self):
+        bad = [{'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': [], 'arguments': {}}},
+               {'jsonrpc': '2.0', 'id': 2, 'method': 'initialize', 'params': 'bad'},
+               {'jsonrpc': '2.0', 'id': 3, 'method': 'initialize', 'params': [1, 2]},
+               {'jsonrpc': '2.0', 'id': 4, 'method': ['x']},
+               {'jsonrpc': '2.0', 'id': 5, 'method': 'tools/call', 'params': {'name': 'drop_doctor', 'arguments': []}},
+               {'jsonrpc': '2.0', 'id': 6, 'method': 'tools/call', 'params': {'name': 'drop_doctor', 'arguments': {}}}]
+        replies = self.run_lines(*(json.dumps(b) for b in bad))
+        self.assertEqual([r['id'] for r in replies], [1, 2, 3, 4, 5, 6])
+        self.assertTrue(all('error' in r for r in replies[:5]))
+        self.assertIn('result', replies[5])               # still serving after five bad requests
+
+    def test_a_cli_that_cannot_start_is_refused(self):
+        def missing(argv, **kw):
+            raise FileNotFoundError(argv[0])
+        out = json.loads(self.server(run=missing).call('drop_doctor', {})['content'][0]['text'])
+        self.assertEqual(out['error']['code'], 'cli_unavailable')
+
+
 class Protocol(Fixture):
     def test_initialize_list_and_call_over_stdio(self):
         lines = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},

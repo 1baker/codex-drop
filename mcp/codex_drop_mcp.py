@@ -31,6 +31,19 @@ class Refused(Exception):
     pass
 
 
+def _no_duplicates(pairs):
+    """Strict JSON (review finding on PR2): a duplicated key anywhere is refused instead of silently keeping the last
+    one, so the CLI's own duplicate-field rejection can never be bypassed through this wrapper."""
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError('duplicate key')
+    return dict(pairs)
+
+
+def strict_loads(text):
+    return json.loads(text, object_pairs_hook=_no_duplicates)
+
+
 def store_root():
     root = os.environ.get('CODEX_DROP_STORE_ROOT') or str(pathlib.Path.home() / '.local/state/codex-drop/stores')
     return pathlib.Path(root).expanduser().absolute()
@@ -54,17 +67,28 @@ class DropServer:
     def __init__(self, run=subprocess.run, agent=AGENT, python=sys.executable, root=None):
         self.run, self.agent, self.python, self.root = run, agent, python, root
 
+    UNCERTAIN = {'ok': False, 'state': 'uncertain',
+                 'next': 'call drop_receipt with the same store, task_id and operation_id; do not re-run'}
+
     def _cli(self, args, stdin=None):
         argv = [self.python, '-I', '-B', str(self.agent)] + args
         try:
             proc = self.run(argv, input=stdin, capture_output=True, text=True, timeout=TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            return {'ok': False, 'state': 'uncertain',
-                    'next': 'call drop_receipt with the same store, task_id and operation_id; do not re-run'}
+            return dict(self.UNCERTAIN)
+        except OSError:
+            # The CLI never started, so nothing can have happened.
+            return {'ok': False, 'state': 'refused', 'error': {'code': 'cli_unavailable'}}
         try:
-            return json.loads(proc.stdout)
-        except ValueError:
-            return {'ok': False, 'state': 'refused', 'error': {'code': 'unreadable_cli_output'}}
+            result = json.loads(proc.stdout)
+            if not isinstance(result, dict):
+                raise ValueError('not an object')
+            return result
+        except (ValueError, TypeError):
+            # Review finding on PR2: the CLI writes before it prints, so a child that ended without a readable
+            # acknowledgement (killed, crashed, truncated output) may have done the work. That is uncertain, not
+            # refused: recover through the original operation's receipt, never by re-running.
+            return dict(self.UNCERTAIN, detail='no readable acknowledgement from the CLI')
 
     def doctor(self):
         return self._cli(['doctor'])
@@ -100,7 +124,7 @@ class DropServer:
 
     def call(self, name, arguments):
         tools = self.tools()
-        if name not in tools or not isinstance(arguments, dict):
+        if not isinstance(name, str) or name not in tools or not isinstance(arguments, dict):
             return {'content': [{'type': 'text', 'text': json.dumps({'error': 'unknown_tool'})}], 'isError': True}
         handler, schema, _ = tools[name]
         if set(arguments) - set(schema['properties']) or set(schema['required']) - set(arguments):
@@ -124,27 +148,43 @@ def reply(out, message_id, result=None, error=None):
 def serve(server, stdin=sys.stdin, stdout=sys.stdout):
     for line in stdin:
         try:
-            message = json.loads(line)
+            message = strict_loads(line)
         except ValueError:
             reply(stdout, None, error={'code': -32700, 'message': 'parse error'})
             continue
         if not isinstance(message, dict) or 'id' not in message:
             continue                                    # notifications get no reply
-        method, params, mid = message.get('method'), message.get('params') or {}, message.get('id')
-        if method == 'initialize':
-            reply(stdout, mid, {'protocolVersion': params.get('protocolVersion') or PROTOCOL_VERSION,
-                                'capabilities': {'tools': {'listChanged': False}},
-                                'serverInfo': {'name': 'codex-drop', 'version': '1.0.0'},
-                                'instructions': INSTRUCTIONS})
-        elif method == 'ping':
-            reply(stdout, mid, {})
-        elif method == 'tools/list':
-            reply(stdout, mid, {'tools': [{'name': n, 'description': d, 'inputSchema': s}
-                                          for n, (_, s, d) in server.tools().items()]})
-        elif method == 'tools/call' and isinstance(params, dict):
-            reply(stdout, mid, server.call(params.get('name'), params.get('arguments', {})))
-        else:
-            reply(stdout, mid, error={'code': -32601, 'message': 'method not found'})
+        try:
+            handle(server, message, stdout)
+        except Exception:                                # noqa: BLE001 - one bad request never ends the session
+            reply(stdout, message.get('id'), error={'code': -32603, 'message': 'internal error'})
+
+
+def handle(server, message, stdout):
+    method, params, mid = message.get('method'), message.get('params', {}), message.get('id')
+    if params is None:
+        params = {}
+    if not isinstance(method, str) or not isinstance(params, dict):
+        reply(stdout, mid, error={'code': -32600, 'message': 'invalid request'})
+        return
+    if method == 'initialize':
+        reply(stdout, mid, {'protocolVersion': params.get('protocolVersion') or PROTOCOL_VERSION,
+                            'capabilities': {'tools': {'listChanged': False}},
+                            'serverInfo': {'name': 'codex-drop', 'version': '1.0.0'},
+                            'instructions': INSTRUCTIONS})
+    elif method == 'ping':
+        reply(stdout, mid, {})
+    elif method == 'tools/list':
+        reply(stdout, mid, {'tools': [{'name': n, 'description': d, 'inputSchema': s}
+                                      for n, (_, s, d) in server.tools().items()]})
+    elif method == 'tools/call':
+        name, arguments = params.get('name'), params.get('arguments', {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            reply(stdout, mid, error={'code': -32602, 'message': 'name must be a string, arguments an object'})
+            return
+        reply(stdout, mid, server.call(name, arguments))
+    else:
+        reply(stdout, mid, error={'code': -32601, 'message': 'method not found'})
 
 
 if __name__ == '__main__':

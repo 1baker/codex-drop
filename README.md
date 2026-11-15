@@ -133,3 +133,17 @@ screen-reader behavior or preservation of your particular live draft.
 ## License
 
 MIT. The original Cochran Research Group copyright is preserved in [LICENSE](LICENSE).
+
+## MCP server for agents (#220)
+
+`mcp/codex_drop_mcp.py` is a stdio MCP server, so any agent (Codex tabs, Claude, Dot) can use Screenshot Drop's agent workflows as tools:
+
+| Tool | What it does |
+| --- | --- |
+| `drop_doctor` | Shows the limits, the retention rules and the guide path. |
+| `drop_run` | Runs one `codex-drop-agent` request (init, ingest, inspect, pair, feedback, promote, pack, unpack) against a task store. |
+| `drop_receipt` | Reads the recorded result of an earlier operation. Use it after a timeout. |
+
+It is a thin wrapper. The CLI keeps its whole contract: strict request schema, digests, registered roots, caps and no retention. Stores must sit under `CODEX_DROP_STORE_ROOT` (default `~/.local/state/codex-drop/stores`). The server passes an argument list and never uses a shell. A timeout is reported as `uncertain` and never re-run.
+
+Register it with `python3 -I -B /path/to/codex-drop/mcp/codex_drop_mcp.py` as the command.

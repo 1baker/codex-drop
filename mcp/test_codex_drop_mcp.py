@@ -124,9 +124,53 @@ class ReviewFindings(Fixture):
 
     def test_a_cli_that_cannot_start_is_refused(self):
         def missing(argv, **kw):
-            raise FileNotFoundError(argv[0])
+            raise m.StartFailed('FileNotFoundError')
         out = json.loads(self.server(run=missing).call('drop_doctor', {})['content'][0]['text'])
         self.assertEqual(out['error']['code'], 'cli_unavailable')
+
+    def test_an_io_error_after_the_cli_started_is_uncertain(self):
+        """Native Spec finding on PR2 at 47c9528: an OSError while reading a started child's output is not proof it
+        never ran."""
+        def broken_pipe(argv, **kw):
+            self.calls.append(argv)
+            raise BrokenPipeError('read failed after start')
+        out = json.loads(self.server(run=broken_pipe).call(
+            'drop_run', {'store': str(self.root / 't1'), 'request': {'operation': 'ingest'}})['content'][0]['text'])
+        self.assertEqual(out['state'], 'uncertain')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_run_cli_separates_start_failure_from_post_start_errors(self):
+        class NoStart:
+            def __init__(self, *a, **kw):
+                raise FileNotFoundError('no python')
+        with self.assertRaises(m.StartFailed):
+            m.run_cli(['x'], popen=NoStart)
+        state = {}
+
+        class Started:
+            returncode = None
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def communicate(self, input=None, timeout=None):
+                raise OSError('pipe read failed')
+
+            def kill(self):
+                state['killed'] = True
+
+            def wait(self):
+                state['reaped'] = True
+        with self.assertRaises(OSError) as raised:
+            m.run_cli(['x'], popen=Started)
+        self.assertNotIsInstance(raised.exception, m.StartFailed)
+        self.assertEqual(state, {'killed': True, 'reaped': True})
+
+        class Slow(Started):
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired('x', timeout)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            m.run_cli(['x'], popen=Slow)
 
 
 class Protocol(Fixture):

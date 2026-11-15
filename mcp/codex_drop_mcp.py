@@ -63,8 +63,29 @@ def checked_store(store, root=None):
     return str(path)
 
 
+class StartFailed(Exception):
+    """The CLI process could not be created at all, so it cannot have done anything."""
+
+
+def run_cli(argv, input=None, timeout=TIMEOUT_S, popen=subprocess.Popen):
+    """Start the CLI, then talk to it, keeping the two failure points apart (native Spec finding on PR2): only a
+    failure to create the process is StartFailed. Anything after it started (timeout, an I/O error while reading
+    its output) leaves its effects unknown; the child is killed and reaped, and the caller reports uncertain."""
+    try:
+        proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as error:
+        raise StartFailed(type(error).__name__) from error
+    try:
+        stdout, _ = proc.communicate(input=input, timeout=timeout)
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return type('Done', (), {'stdout': stdout, 'returncode': proc.returncode})()
+
+
 class DropServer:
-    def __init__(self, run=subprocess.run, agent=AGENT, python=sys.executable, root=None):
+    def __init__(self, run=run_cli, agent=AGENT, python=sys.executable, root=None):
         self.run, self.agent, self.python, self.root = run, agent, python, root
 
     UNCERTAIN = {'ok': False, 'state': 'uncertain',
@@ -73,12 +94,13 @@ class DropServer:
     def _cli(self, args, stdin=None):
         argv = [self.python, '-I', '-B', str(self.agent)] + args
         try:
-            proc = self.run(argv, input=stdin, capture_output=True, text=True, timeout=TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            return dict(self.UNCERTAIN)
-        except OSError:
-            # The CLI never started, so nothing can have happened.
+            proc = self.run(argv, input=stdin, timeout=TIMEOUT_S)
+        except StartFailed:
+            # The process was never created, so nothing can have happened.
             return {'ok': False, 'state': 'refused', 'error': {'code': 'cli_unavailable'}}
+        except (subprocess.TimeoutExpired, OSError):
+            # Started, then timed out or its output couldn't be read: it may have done the work.
+            return dict(self.UNCERTAIN)
         try:
             result = json.loads(proc.stdout)
             if not isinstance(result, dict):
